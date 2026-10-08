@@ -82,9 +82,24 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     return { key: `${await segmentKey(voice.engine, voice.voice, req.instruct?.trim() ?? '', speedOf(req), text)}.${format}`, voice }
   }
 
+  // Один и тот же кусок разом (клиент + предзагрузка) — один синтез.
+  const inflight = new Map<string, Promise<SynthResult>>()
+
   async function synth(text: string, req: SpeakRequest, format: Format, signal?: AbortSignal): Promise<SynthResult> {
     if (!text.trim()) throw new Error('speak: пустой текст')
     const { key: k, voice } = await key(text, req, format)
+    const running = inflight.get(k)
+    if (running) return running
+    const p = synthOnce(text, req, format, k, voice, signal)
+    inflight.set(k, p)
+    try {
+      return await p
+    } finally {
+      inflight.delete(k)
+    }
+  }
+
+  async function synthOnce(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved, signal?: AbortSignal): Promise<SynthResult> {
     const contentType = CONTENT_TYPE[format]
     const hit = await o.cache?.get(k)
     if (hit) {

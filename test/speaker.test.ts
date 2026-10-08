@@ -29,6 +29,14 @@ describe('speaker', () => {
     expect((await s.key('Привет', {}, 'mp3')).key).not.toBe(a.key)
   })
 
+  it('один кусок разом дважды — один синтез', async () => {
+    const v = mockEngine({ kind: 'vertex' })
+    const s = createSpeaker({ engines: { vertex: v.engine }, defaultVoice: 'vertex:Kore' })
+    const [a, b] = await Promise.all([s.synth('x', {}, 'pcm'), s.synth('x', {}, 'pcm')])
+    expect(dec(a.data)).toBe(dec(b.data))
+    expect(v.calls.length).toBe(1)
+  })
+
   it('темп: свой у движка — в speak; иначе — atempo в ffmpeg; mp3-хинт движку', async () => {
     const edge = mockEngine({ kind: 'edge', voices: ['ru-RU-SvetlanaNeural'], nativeSpeed: true, mime: 'audio/mpeg' })
     const vertex = mockEngine({ kind: 'vertex' })
