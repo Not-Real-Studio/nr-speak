@@ -1,6 +1,6 @@
 # @notrealstudio/speak
 
-Текст → речь для любых проектов: движки за одним интерфейсом `TtsEngine` — Gemini 3.8 TTS
+Текст → речь (и обратно) для любых проектов: движки за одним интерфейсом `TtsEngine` — Gemini 3.8 TTS
 в Vertex AI (OAuth) и в AI Studio (ключ, свои голоса Voice design), маршрут по голосу между
 ними, Google Cloud TTS Chirp 3 HD, Microsoft Edge read-aloud (бесплатно, без ключа), любой
 OpenAI-совместимый `/v1/audio/speech` (локальный mlx-audio и подобные). Сверху — единый
@@ -80,6 +80,35 @@ ffmpeg, остальное — ffmpeg (`ffmpegArgs`, темп — `atempo`).
 выбор одного движка сервиса voice nrchat (`$voice_provider`). `diskCache(dir)`,
 `ffmpegRunner(bin?)`.
 
+## Распознавание
+
+Обратное направление — речь → текст: Gemini 3.5 Transcribe (`gemini-3.5-transcribe`) через
+Gemini API (AI Studio, ключ), Interactions API `POST /v1beta/interactions`.
+
+```ts
+import { createGeminiTranscriber } from '@notrealstudio/speak'
+import { listenerFromCtx, audioDuration, ffprobeOf, ffmpegRunner } from '@notrealstudio/speak/node'
+
+const stt = createGeminiTranscriber({ apiKey })                       // ядро: байты/uri → текст
+const t = await stt.transcribe({ data: mp3, mime: 'audio/mp3' }, { language: 'ru', vocabulary: ['runz', 'nrlib'] })
+// → { text, language, model, vocabulary: 2 }
+
+const listener = listenerFromCtx(ctx, { ffmpeg: ffmpegRunner(), duration: (d) => audioDuration(d, ffprobeOf()) })
+const m = await listener.transcribe(bytes, { diarize: true, vocabulary })   // любой формат, любой размер
+// → { text, segments: [{start, end, text, speaker: 'A'|'B'…}], words, duration, attempts, truncated?, uploaded, converted }
+```
+
+`TranscribeOpts`: `language` (BCP-47; нет — автоопределение), `vocabulary` (до 1000 терминов,
+`custom_vocabulary`), `segments` (таймстемпы слов → сегменты), `diarize` (спикеры, включает
+таймстемпы). Сегменты — `segmentsOf(words)`: смена спикера, конец предложения, пауза > 1 с,
+40 слов. Язык провайдер не отдаёт — заданный или по письменности (`guessLanguage`).
+`sniffAudio(bytes)` — mime по сигнатуре (wav, mp3, ogg/opus, flac, webm, m4a, aac, aiff).
+
+`/node`: `prepareAudio` — неопознанное → mp3 через ffmpeg; до `INLINE_MAX` (14 МБ) — inline,
+больше — `uploadFile` (Files API, resumable) и `deleteFile` после; `audioDuration` — ffprobe
+по временному файлу; `listenerFromCtx(ctx)` — ключ `## $provider google` (`$studio_provider`),
+модель — `$listen_model` блока `## $speak` (`studio:gemini-3.5-transcribe`).
+
 ## Грабли
 
 - Лимит Gemini — ~4000 **байт** на запрос: кириллица — 2 байта на букву, поэтому потолок куска
@@ -90,6 +119,15 @@ ffmpeg, остальное — ffmpeg (`ffmpegArgs`, темп — `atempo`).
   проекте должен быть включён.
 - Vertex своих голосов (`voice_…`) не видит: они только в AI Studio, маршрут —
   `createRoutedEngine`.
+- Transcribe: `custom_vocabulary` провайдер не совмещает ни с диаризацией, ни с таймстемпами
+  (400 «incompatible»), а диаризация без таймстемпов слов не отдаёт. Поэтому сегменты со
+  словарём — два запроса разом (текст со словарём + слова с временем и спикерами без него) и
+  `alignWords` (Нидлман — Вунш по словам): время и спикер переносятся на текст со словарём.
+- Transcribe изредка обрывает ответ с таймстемпами при `status: completed` (слова до середины
+  записи). `Listener` с `duration` сверяет последнее слово с длительностью и повторяет раз;
+  не помогло — `truncated: true`. Реплики разных спикеров модель склеивает без пробела
+  («стриминг.Всё») — `parseInteraction` вставляет его.
+- AI Studio Tier 1 — 10 запросов в минуту на модель; с таймстемпами — до 30 мин звука.
 
 ## Тесты
 
