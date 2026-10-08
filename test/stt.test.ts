@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createGeminiTranscriber, guessLanguage, mergeVocabulary, parseInteraction, segmentsOf, sniffAudio, speakerLabel, transcribeBody } from '../src/index.js'
+import { alignWords, createGeminiTranscriber, guessLanguage, mergeVocabulary, parseInteraction, segmentsOf, sniffAudio, speakerLabel, transcribeBody } from '../src/index.js'
 import { createListener, ffprobeOf, listenModelOf, listenerFromCtx } from '../src/node/index.js'
 import { fakeCtx, json } from './helpers.js'
 
@@ -98,14 +98,54 @@ describe('stt: движок', () => {
     expect(calls).toBe(1)
   })
 
-  it('сегменты — со словами и сегментами', async () => {
-    const engine = createGeminiTranscriber({ apiKey: 'k', fetch: (async () => json(interaction('Да. Нет.', [word('Да.', 0, 0.5, 'spk:0'), word('Нет.', 0.6, 1, 'spk:1')]))) as unknown as typeof fetch })
-    const t = await engine.transcribe({ data: new Uint8Array(1), mime: 'audio/mp3' }, { diarize: true, vocabulary: ['x'] })
+  it('сегменты без словаря — один запрос с таймстемпами и диаризацией', async () => {
+    let calls = 0
+    const engine = createGeminiTranscriber({ apiKey: 'k', fetch: (async () => (calls++, json(interaction('Да. Нет.', [word('Да.', 0, 0.5, 'spk:0'), word('Нет.', 0.6, 1, 'spk:1')])))) as unknown as typeof fetch })
+    const t = await engine.transcribe({ data: new Uint8Array(1), mime: 'audio/mp3' }, { diarize: true })
+    expect(calls).toBe(1)
     expect(t.vocabulary).toBe(0)
     expect(t.segments).toEqual([
       { start: 0, end: 0.5, text: 'Да.', speaker: 'A' },
       { start: 0.6, end: 1, text: 'Нет.', speaker: 'B' },
     ])
+  })
+
+  it('сегменты со словарём — два прохода разом: текст со словарём, время и спикеры — выравниванием', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const engine = createGeminiTranscriber({
+      apiKey: 'k',
+      fetch: (async (_u: string, init: RequestInit) => {
+        const b = JSON.parse(String(init.body)) as { generation_config?: { transcription_config?: Record<string, unknown> } }
+        bodies.push(b)
+        return b.generation_config?.transcription_config?.custom_vocabulary
+          ? json(interaction('Запусти runz Projektor. Sulafat читает.'))
+          : json(interaction('Запусти ранс-проектор. Сулафат читает.', [word('Запусти', 0, 0.5, 'spk:0'), word('ранс-проектор.', 0.5, 1.5, 'spk:0'), word('Сулафат', 2, 2.5, 'spk:1'), word('читает.', 2.5, 3, 'spk:1')]))
+      }) as typeof fetch,
+    })
+    const t = await engine.transcribe({ data: new Uint8Array(1), mime: 'audio/mp3' }, { diarize: true, vocabulary: ['runz', 'Projektor', 'Sulafat'] })
+    expect(bodies).toHaveLength(2)
+    expect(t.text).toBe('Запусти runz Projektor. Sulafat читает.')
+    expect(t.vocabulary).toBe(3)
+    expect(t.segments).toEqual([
+      { start: 0, end: 1.5, text: 'Запусти runz Projektor.', speaker: 'A' },
+      { start: 2, end: 3, text: 'Sulafat читает.', speaker: 'B' },
+    ])
+  })
+
+  it('выравнивание: совпадения и замены берут время пары, лишние слова — между соседями', () => {
+    const timed = [
+      { text: 'один', start: 0, end: 1, speaker: 'A' },
+      { text: 'два', start: 1, end: 2, speaker: 'A' },
+      { text: 'три', start: 3, end: 4, speaker: 'B' },
+    ]
+    expect(alignWords('Один, полтора два три', timed)).toEqual([
+      { text: 'Один,', start: 0, end: 1, speaker: 'A' },
+      { text: 'полтора', start: 1, end: 1, speaker: 'A' },
+      { text: 'два', start: 1, end: 2, speaker: 'A' },
+      { text: 'три', start: 3, end: 4, speaker: 'B' },
+    ])
+    expect(alignWords('', timed)).toEqual([])
+    expect(alignWords('x', [])).toEqual([{ text: 'x', start: 0, end: 0 }])
   })
 })
 

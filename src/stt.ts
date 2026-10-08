@@ -7,8 +7,8 @@
  * (до 1000 терминов), `language_codes` (пусто — автоопределение), `mode.diarization_mode`,
  * `mode.timestamp_granularities: ['word']`. Провайдер (08.10.2026) отвергает словарь вместе с
  * диаризацией и таймстемпами («custom_vocabulary is incompatible with …»), а диаризация без
- * таймстемпов не отдаёт слов — поэтому сегменты (таймстемпы, спикеры) идут без словаря, и
- * `Transcript.vocabulary` честно говорит, сколько терминов ушло в запрос.
+ * таймстемпов не отдаёт слов — поэтому сегменты со словарём — два прохода разом (текст со
+ * словарём + слова с временем и спикерами без него) и выравнивание слов (`alignWords`).
  */
 
 import { retryDelay } from './gemini.js'
@@ -24,7 +24,7 @@ export type AudioInput = { data: Uint8Array; mime: string } | { uri: string; mim
 export interface TranscribeOpts {
   /** BCP-47 (`ru`, `en-US`); нет — автоопределение. */
   language?: string | undefined
-  /** Термины для распознавания (лексикон ∪ vocabulary ∪ prompt). С `segments` не уходят — см. шапку. */
+  /** Термины для распознавания (лексикон ∪ vocabulary ∪ prompt). С сегментами — второй проход, см. шапку. */
   vocabulary?: readonly string[] | undefined
   /** Спикеры у сегментов (включает и таймстемпы). */
   diarize?: boolean | undefined
@@ -54,7 +54,7 @@ export interface Transcript {
   segments?: TranscriptSegment[] | undefined
   words?: TranscriptWord[] | undefined
   model: string
-  /** Сколько терминов словаря ушло в запрос (0 — без словаря). */
+  /** Сколько терминов словаря ушло в запрос (0 — без словаря); с сегментами и словарём — два запроса. */
   vocabulary: number
 }
 
@@ -211,38 +211,122 @@ export function createGeminiTranscriber(o: GeminiTranscriberOpts): SttEngine {
   const maxWait = o.maxRetryWait ?? 30_000
   const sleep = o.sleep ?? abortableSleep
 
+  /** Один запрос: повторы поминутного 429, ошибка провайдера — текстом со статусом. */
+  async function once(audio: AudioInput, opts: TranscribeOpts): Promise<{ text: string; words: TranscriptWord[] }> {
+    const payload = JSON.stringify(transcribeBody(audio, model, opts))
+    let res: Response
+    for (let attempt = 0; ; attempt++) {
+      res = await http(url, { method: 'POST', headers: { 'x-goog-api-key': o.apiKey, 'content-type': 'application/json' }, body: payload, ...(opts.signal ? { signal: opts.signal } : {}) })
+      if (res.status !== 429) break
+      const text = await res.clone().text().catch(() => '')
+      const wait = retryDelay(text)
+      if (/PerDay/i.test(text) || attempt >= retries || wait > maxWait) break
+      await sleep(wait, opts.signal)
+    }
+    if (!res.ok) throw await errorOf(res, model)
+    const data = (await res.json()) as InteractionResponse
+    if (data.error) throw statusError(`listen: ${model} — ${data.error.message ?? 'ошибка провайдера'}`, 502)
+    if (data.status && data.status !== 'completed') throw statusError(`listen: ${model} — статус «${data.status}»`, 502)
+    return parseInteraction(data)
+  }
+
   return {
     kind: 'studio',
     model,
     async transcribe(audio, opts = {}) {
-      const body = transcribeBody(audio, model, opts)
-      const vocabulary = ((body.generation_config as { transcription_config?: { custom_vocabulary?: string[] } } | undefined)?.transcription_config?.custom_vocabulary ?? []).length
-      const payload = JSON.stringify(body)
-      let res: Response
-      for (let attempt = 0; ; attempt++) {
-        res = await http(url, { method: 'POST', headers: { 'x-goog-api-key': o.apiKey, 'content-type': 'application/json' }, body: payload, ...(opts.signal ? { signal: opts.signal } : {}) })
-        if (res.status !== 429) break
-        const text = await res.clone().text().catch(() => '')
-        const wait = retryDelay(text)
-        if (/PerDay/i.test(text) || attempt >= retries || wait > maxWait) break
-        await sleep(wait, opts.signal)
-      }
-      if (!res.ok) throw await errorOf(res, model)
-      const data = (await res.json()) as InteractionResponse
-      if (data.error) throw statusError(`listen: ${model} — ${data.error.message ?? 'ошибка провайдера'}`, 502)
-      if (data.status && data.status !== 'completed') throw statusError(`listen: ${model} — статус «${data.status}»`, 502)
-      const { text, words } = parseInteraction(data)
       const timed = !!(opts.segments || opts.diarize)
+      const vocab = mergeVocabulary(opts.vocabulary)
+      let text: string
+      let words: TranscriptWord[] = []
+      if (timed && vocab.length) {
+        // Словарь с таймстемпами провайдер не совмещает — два прохода разом: текст со словарём,
+        // слова с временем и спикерами без него; время и спикеры переносятся на текст выравниванием.
+        const [a, b] = await Promise.all([once(audio, { ...opts, segments: false, diarize: false, vocabulary: vocab }), once(audio, { ...opts, vocabulary: [] })])
+        text = a.text
+        words = alignWords(a.text, b.words)
+      } else {
+        ;({ text, words } = await once(audio, { ...opts, vocabulary: vocab }))
+      }
       const language = opts.language || guessLanguage(text)
       return {
         text,
         ...(language ? { language } : {}),
         ...(timed ? { words, segments: segmentsOf(words) } : {}),
         model,
-        vocabulary,
+        vocabulary: vocab.length,
       }
     },
   }
+}
+
+const norm = (w: string): string => w.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+
+/**
+ * Слова текста `text` получают время и спикера от слов другого прохода (`timed`):
+ * выравнивание Нидлмана — Вунша по нормализованным словам (совпадение +2, замена −0.5,
+ * пропуск −1: «Сулафат» ↔ «Sulafat» встают в пару как замена). Слово без пары — время между
+ * соседями, спикер — предыдущего.
+ */
+export function alignWords(text: string, timed: readonly TranscriptWord[]): TranscriptWord[] {
+  const a = text.split(/\s+/).filter(Boolean)
+  const n = a.length
+  const m = timed.length
+  if (!n) return []
+  if (!m) return a.map((t) => ({ text: t, start: 0, end: 0 }))
+  const an = a.map(norm)
+  const bn = timed.map((w) => norm(w.text))
+  const MATCH = 2
+  const SUB = -0.5
+  const GAP = -1
+  // Траектория: 0 — диагональ, 1 — пропуск в b (слово a без пары), 2 — пропуск в a.
+  const dir = new Uint8Array((n + 1) * (m + 1))
+  let prev = new Float64Array(m + 1)
+  let cur = new Float64Array(m + 1)
+  for (let j = 0; j <= m; j++) {
+    prev[j] = j * GAP
+    dir[j] = 2
+  }
+  for (let i = 1; i <= n; i++) {
+    cur[0] = i * GAP
+    dir[i * (m + 1)] = 1
+    for (let j = 1; j <= m; j++) {
+      const d = prev[j - 1]! + (an[i - 1] && an[i - 1] === bn[j - 1] ? MATCH : SUB)
+      const up = prev[j]! + GAP
+      const left = cur[j - 1]! + GAP
+      if (d >= up && d >= left) [cur[j], dir[i * (m + 1) + j]] = [d, 0]
+      else if (up >= left) [cur[j], dir[i * (m + 1) + j]] = [up, 1]
+      else [cur[j], dir[i * (m + 1) + j]] = [left, 2]
+    }
+    ;[prev, cur] = [cur, prev]
+  }
+  const pair: (number | undefined)[] = new Array(n)
+  for (let i = n, j = m; i > 0 || j > 0; ) {
+    const d = dir[i * (m + 1) + j]
+    if (i > 0 && j > 0 && d === 0) pair[--i] = --j
+    else if (i > 0 && (j === 0 || d === 1)) i--
+    else j--
+  }
+  const out: TranscriptWord[] = a.map((t, i) => {
+    const w = pair[i] !== undefined ? timed[pair[i]!] : undefined
+    return w ? { text: t, start: w.start, end: w.end, ...(w.speaker ? { speaker: w.speaker } : {}) } : { text: t, start: NaN, end: NaN }
+  })
+  // Без пары: время — между соседями с парой, спикер — предыдущего (или следующего).
+  for (let i = 0; i < n; i++) {
+    const w = out[i]!
+    if (!Number.isNaN(w.start)) continue
+    let l = i - 1
+    while (l >= 0 && Number.isNaN(out[l]!.start)) l--
+    let r = i + 1
+    while (r < n && Number.isNaN(out[r]!.start)) r++
+    const left = l >= 0 ? out[l]! : undefined
+    const right = r < n ? out[r]! : undefined
+    w.start = left ? left.end : (right?.start ?? 0)
+    w.end = right ? right.start : (left?.end ?? w.start)
+    if (w.end < w.start) w.end = w.start
+    const sp = left?.speaker ?? right?.speaker
+    if (sp) w.speaker = sp
+  }
+  return out
 }
 
 /** Mime по сигнатуре байтов: что модель берёт как есть; нет — перекодировать (ffmpeg). */
