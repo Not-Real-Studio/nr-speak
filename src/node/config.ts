@@ -146,9 +146,9 @@ export function fileCache(file: string, dir: string): VoiceCache {
 
 /** Настройка speak: атрибут блока `## $speak` (`$key`) или корневой `$speak_key`. */
 export function speakOpt(ctx: unknown, name: string): unknown {
-  const block = ctxGet(ctx, ['speak'])
-  const v = block && typeof block === 'object' && 'get' in block ? ctxGet(block, [name]) : undefined
-  return v ?? ctxGet(ctx, [`speak_${name}`])
+  // Путём, не через блок: `ctx.get(['speak'])` у runz отдаёт тело блока, а не объект атрибутов.
+  const v = ctxGet(ctx, ['speak', name])
+  return v === '' ? undefined : (v ?? ctxGet(ctx, [`speak_${name}`]))
 }
 
 /** Список из конфига: `$[a, b]` (IArray runz), JS-массив или строка `a, b`. */
@@ -197,8 +197,7 @@ export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
   const oname = str(speakOpt(ctx, 'openai_provider'))
   if (on('openai') && oname) {
     const p = providerOf(ctx, oname)
-    const block = ctxGet(ctx, ['provider', oname])
-    const model = block && typeof block === 'object' && 'get' in block ? str(ctxGet(block, ['model'])) : undefined
+    const model = str(ctxGet(ctx, ['provider', oname, 'model']))
     if (!p.baseUrl || !model) throw new Error(`speak: у провайдера ${oname} нужны $base_url и $model (## $provider ${oname} ~/.runz/config.md)`)
     const voices = listOf(speakOpt(ctx, 'openai_voices'))
     out.openai = createOpenAIEngine({ baseUrl: p.baseUrl, model, ...(p.apiKey ? { apiKey: p.apiKey } : {}), ...(voices ? { voices, defaultVoice: voices[0] } : {}), ...common })
