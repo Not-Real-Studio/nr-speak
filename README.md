@@ -18,7 +18,7 @@ import { createSpeaker, l0Markdown, segment } from '@notrealstudio/speak'
 import { diskCache, enginesFromCtx, fileCache, ffmpegRunner } from '@notrealstudio/speak/node'
 
 const engines = enginesFromCtx(ctx, { cache: fileCache('voices.json', '.') }) // ctx — IContext runz
-const speaker = createSpeaker({ engines, defaultVoice: 'vertex:Kore', cache: diskCache('speak-cache'), ffmpeg: ffmpegRunner() })
+const speaker = createSpeaker({ engines, defaultVoice: 'vertex:Sulafat', favorites: ['Sulafat', 'Leda', 'Enceladus'], cache: diskCache('speak-cache'), ffmpeg: ffmpegRunner() })
 
 const { blocks } = l0Markdown(markdown)                        // нормализатор L0
 const texts = segment(blocks).map((s) => s.text)               // куски 1–1.5K символов, первый короткий
@@ -45,7 +45,7 @@ const one = await speaker.synth('Привет', { voice: 'chirp:Aoede', speed: 1
 `coalesce` — склейка мелких кадров PCM для провода.
 
 **Голоса.** `catalog(engines, {engine?}) → {voices: [{id, engine, voice, lang, gender, tier}], errors}`
-— тиры: `vertex` premium, `studio` cheap, `chirp`/`edge` free, `openai` local; упавший
+— `favorite: true` у голосов из `favorites` (полное имя или голос без префикса; избранные — первыми); тиры: `vertex` premium, `studio` cheap, `chirp`/`edge` free, `openai` local; упавший
 движок — в `errors`, остальные отдаются. `resolveVoice(engines, name, {engine?, defaultVoice?})`:
 `vertex:Kore` — как есть; короткое имя — Vertex → Studio → Chirp → Edge → OpenAI (точный id
 без регистра, затем однозначная часть: `Svetlana` → `edge:ru-RU-SvetlanaNeural`,

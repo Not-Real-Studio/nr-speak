@@ -30,6 +30,8 @@ export interface CatalogVoice {
   tier: Tier
   /** Описание своего голоса (Voice design). */
   design?: string
+  /** Избранный (список — из конфига, `$speak_favorites`). */
+  favorite?: true
 }
 
 export interface Resolved {
@@ -108,8 +110,21 @@ async function within(engines: Engines, n: EngineName, voice: string): Promise<R
 
 const configured = (engines: Engines): string => ENGINE_NAMES.filter((n) => engines[n]).join(', ') || 'ни одного'
 
+/**
+ * Избранный ли голос: элемент списка — полное имя (`vertex:Sulafat`) или голос без префикса
+ * (`Sulafat` — совпадение по id внутри любого движка, без регистра).
+ */
+export function isFavorite(v: { id: string; voice: string }, favorites: readonly string[]): boolean {
+  const id = v.id.toLowerCase()
+  const voice = v.voice.toLowerCase()
+  return favorites.some((f) => {
+    const x = f.trim().toLowerCase()
+    return x === id || x === voice
+  })
+}
+
 /** Каталог: голоса всех (или одного) движков; упавший движок — в `errors`, остальные отдаются. */
-export async function catalog(engines: Engines, o: { engine?: string | undefined } = {}): Promise<{ voices: CatalogVoice[]; errors: { engine: EngineName; error: string }[] }> {
+export async function catalog(engines: Engines, o: { engine?: string | undefined; favorites?: readonly string[] | undefined } = {}): Promise<{ voices: CatalogVoice[]; errors: { engine: EngineName; error: string }[] }> {
   if (o.engine && (!isEngineName(o.engine) || !engines[o.engine])) throw new Error(`speak: движок «${o.engine}» не настроен (есть: ${configured(engines)})`)
   const names = ENGINE_NAMES.filter((n) => engines[n] && (!o.engine || o.engine === n))
   const voices: CatalogVoice[] = []
@@ -128,6 +143,7 @@ export async function catalog(engines: Engines, o: { engine?: string | undefined
             ...(v.lang ? { lang: v.lang } : n === 'vertex' || n === 'studio' ? { lang: 'multi' } : {}),
             ...(v.gender ? { gender: v.gender } : {}),
             ...(v.design ? { design: v.design } : {}),
+            ...(o.favorites && isFavorite({ id: `${n}:${v.id}`, voice: v.id }, o.favorites) ? { favorite: true as const } : {}),
           })
         }
       } catch (err) {
@@ -135,6 +151,8 @@ export async function catalog(engines: Engines, o: { engine?: string | undefined
       }
     }),
   )
-  voices.sort((a, b) => ENGINE_NAMES.indexOf(a.engine) - ENGINE_NAMES.indexOf(b.engine) || a.voice.localeCompare(b.voice))
+  // Избранные — первыми (в порядке списка), дальше — по движку и имени.
+  const rank = (v: CatalogVoice): number => (v.favorite && o.favorites ? o.favorites.findIndex((f) => isFavorite(v, [f])) : Infinity)
+  voices.sort((a, b) => rank(a) - rank(b) || ENGINE_NAMES.indexOf(a.engine) - ENGINE_NAMES.indexOf(b.engine) || a.voice.localeCompare(b.voice))
   return { voices, errors }
 }

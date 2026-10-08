@@ -36,8 +36,10 @@ export interface SynthResult {
 
 export interface SpeakerOpts {
   engines: Engines
-  /** Голос для пустого `voice` (`vertex:Kore`). */
+  /** Голос для пустого `voice` (`vertex:Sulafat`). */
   defaultVoice?: string | undefined
+  /** Избранные голоса каталога (`Sulafat, Leda, Enceladus`). */
+  favorites?: readonly string[] | undefined
   cache?: SegmentCache | undefined
   ffmpeg?: FfmpegRun | undefined
 }
@@ -131,7 +133,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     defaultVoice: o.defaultVoice,
     stats,
     resolve,
-    voices: (engine) => catalog(o.engines, { engine }),
+    voices: (engine) => catalog(o.engines, { engine, favorites: o.favorites }),
     key,
     synth,
     stream,
