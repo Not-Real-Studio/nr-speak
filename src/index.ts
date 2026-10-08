@@ -6,6 +6,7 @@
  *              createChirpEngine · createEdgeEngine · createOpenAIEngine — всё за TtsEngine
  *   голоса     catalog · resolveVoice (`vertex:Kore`, короткое имя: Vertex → Studio → Chirp → Edge)
  *   текст      l0Markdown · l0Text (нормализатор L0) → segment / segmentText (куски)
+ *   речь→текст createGeminiTranscriber (Gemini 3.5 Transcribe) · segmentsOf · sniffAudio
  *   звук       createSpeaker (синтез куска с кэшем, поток кусков) · convert · wavHeader
  */
 
@@ -19,3 +20,4 @@ export * from './segment.js'
 export * from './normalize.js'
 export * from './audio.js'
 export * from './speaker.js'
+export * from './stt.js'

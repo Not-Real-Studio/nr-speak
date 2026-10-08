@@ -1,0 +1,263 @@
+/**
+ * Речь → текст (DEV-252, listen-spec): Gemini 3.5 Transcribe через Gemini API (AI Studio),
+ * Interactions API (`POST /v1beta/interactions`). Без Node: HTTP — инъекцией `fetch`; загрузка
+ * больших файлов (Files API), длительность и перекодирование — в `/node`.
+ *
+ * Штатные возможности модели (`generation_config.transcription_config`): `custom_vocabulary`
+ * (до 1000 терминов), `language_codes` (пусто — автоопределение), `mode.diarization_mode`,
+ * `mode.timestamp_granularities: ['word']`. Провайдер (08.10.2026) отвергает словарь вместе с
+ * диаризацией и таймстемпами («custom_vocabulary is incompatible with …»), а диаризация без
+ * таймстемпов не отдаёт слов — поэтому сегменты (таймстемпы, спикеры) идут без словаря, и
+ * `Transcript.vocabulary` честно говорит, сколько терминов ушло в запрос.
+ */
+
+import { retryDelay } from './gemini.js'
+import { abortableSleep, statusError } from './types.js'
+
+export const TRANSCRIBE_MODEL = 'gemini-3.5-transcribe'
+/** Потолок словаря у провайдера (лучше всего — до ~100 терминов). */
+export const VOCABULARY_LIMIT = 1000
+
+/** Звук запроса: байты inline или файл Files API (`uri` из `/node` `uploadFile`). */
+export type AudioInput = { data: Uint8Array; mime: string } | { uri: string; mime: string }
+
+export interface TranscribeOpts {
+  /** BCP-47 (`ru`, `en-US`); нет — автоопределение. */
+  language?: string | undefined
+  /** Термины для распознавания (лексикон ∪ vocabulary ∪ prompt). С `segments` не уходят — см. шапку. */
+  vocabulary?: readonly string[] | undefined
+  /** Спикеры у сегментов (включает и таймстемпы). */
+  diarize?: boolean | undefined
+  /** Сегменты с таймстемпами (verbose_json). */
+  segments?: boolean | undefined
+  signal?: AbortSignal | undefined
+}
+
+export interface TranscriptWord {
+  text: string
+  start: number
+  end: number
+  speaker?: string | undefined
+}
+
+export interface TranscriptSegment {
+  start: number
+  end: number
+  text: string
+  speaker?: string | undefined
+}
+
+export interface Transcript {
+  text: string
+  /** Язык: заданный в запросе, иначе — по письменности текста (`ru`/`en`); провайдер его не отдаёт. */
+  language?: string | undefined
+  segments?: TranscriptSegment[] | undefined
+  words?: TranscriptWord[] | undefined
+  model: string
+  /** Сколько терминов словаря ушло в запрос (0 — без словаря). */
+  vocabulary: number
+}
+
+export interface SttEngine {
+  readonly kind: string
+  readonly model: string
+  transcribe(audio: AudioInput, opts?: TranscribeOpts): Promise<Transcript>
+}
+
+export interface GeminiTranscriberOpts {
+  apiKey: string
+  /** Корень API (`https://generativelanguage.googleapis.com`); путь срезается. */
+  baseUrl?: string | undefined
+  model?: string | undefined
+  fetch?: typeof fetch | undefined
+  /** Повторы на поминутный 429 (по умолчанию 3) и потолок ожидания, мс. */
+  retries?: number | undefined
+  maxRetryWait?: number | undefined
+  sleep?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined
+}
+
+const GEMINI_ROOT = 'https://generativelanguage.googleapis.com'
+
+const rootOf = (baseUrl: string | undefined): string => {
+  if (!baseUrl) return GEMINI_ROOT
+  try {
+    return new URL(baseUrl).origin
+  } catch {
+    return GEMINI_ROOT
+  }
+}
+
+function b64encode(bytes: Uint8Array): string {
+  let bin = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(bin)
+}
+
+/** Термины без дублей (без регистра), пустых и сверх потолка — порядок источников сохраняется. */
+export function mergeVocabulary(...lists: readonly (readonly string[] | undefined)[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const list of lists)
+    for (const raw of list ?? []) {
+      const w = raw.trim()
+      const k = w.toLowerCase()
+      if (!w || seen.has(k)) continue
+      seen.add(k)
+      out.push(w)
+    }
+  return out.slice(0, VOCABULARY_LIMIT)
+}
+
+/** Тело Interactions API. Сегменты — без словаря (провайдер их не совмещает). */
+export function transcribeBody(audio: AudioInput, model: string, o: TranscribeOpts = {}): Record<string, unknown> {
+  const item = 'uri' in audio ? { type: 'audio', uri: audio.uri, mime_type: audio.mime } : { type: 'audio', data: b64encode(audio.data), mime_type: audio.mime }
+  const timed = !!(o.segments || o.diarize)
+  const cfg: Record<string, unknown> = {}
+  if (o.language) cfg.language_codes = [o.language]
+  const vocab = timed ? [] : mergeVocabulary(o.vocabulary)
+  if (vocab.length) cfg.custom_vocabulary = vocab
+  if (timed) cfg.mode = { type: 'verbatim', timestamp_granularities: ['word'], ...(o.diarize ? { diarization_mode: 'speaker' } : {}) }
+  return { model, input: [item], ...(Object.keys(cfg).length ? { generation_config: { transcription_config: cfg } } : {}) }
+}
+
+/** `"1.300s"` → 1.3. */
+export const seconds = (v: unknown): number => {
+  const n = Number(String(v ?? '').replace(/s$/, ''))
+  return Number.isFinite(n) ? n : 0
+}
+
+/** `spk:0` → `A`, `spk:1` → `B` (как diarized-ответы OpenAI); незнакомое — как есть. */
+export function speakerLabel(raw: string): string {
+  const m = /(\d+)$/.exec(raw)
+  if (!m) return raw
+  const n = Number(m[1])
+  return n < 26 ? String.fromCharCode(65 + n) : `S${n + 1}`
+}
+
+/** Язык по письменности: кириллица — `ru`, латиница — `en`; пусто — нет. */
+export function guessLanguage(text: string): string | undefined {
+  const cyr = (text.match(/\p{Script=Cyrillic}/gu) ?? []).length
+  const lat = (text.match(/\p{Script=Latin}/gu) ?? []).length
+  if (!cyr && !lat) return undefined
+  return cyr >= lat ? 'ru' : 'en'
+}
+
+/**
+ * Слова → сегменты: новый сегмент на смене спикера, после конца предложения, на паузе
+ * больше `gap` с и сверх `maxWords` слов. Текст сегмента — слова через пробел.
+ */
+export function segmentsOf(words: readonly TranscriptWord[], o: { gap?: number; maxWords?: number } = {}): TranscriptSegment[] {
+  const gap = o.gap ?? 1
+  const maxWords = o.maxWords ?? 40
+  const out: TranscriptSegment[] = []
+  let cur: TranscriptWord[] = []
+  const flush = (): void => {
+    if (!cur.length) return
+    const sp = cur[0]!.speaker
+    out.push({ start: cur[0]!.start, end: cur[cur.length - 1]!.end, text: cur.map((w) => w.text).join(' '), ...(sp ? { speaker: sp } : {}) })
+    cur = []
+  }
+  for (const w of words) {
+    const prev = cur[cur.length - 1]
+    if (prev && (w.speaker !== prev.speaker || /[.!?…]["»”)]*$/.test(prev.text) || w.start - prev.end > gap || cur.length >= maxWords)) flush()
+    cur.push(w)
+  }
+  flush()
+  return out
+}
+
+interface InteractionResponse {
+  status?: string
+  steps?: { type?: string; content?: { type?: string; text?: string; annotations?: Record<string, unknown>[] }[] }[]
+  error?: { message?: string }
+}
+
+/** Ответ Interactions → текст и слова (`word_info`). */
+export function parseInteraction(raw: unknown): { text: string; words: TranscriptWord[] } {
+  const body = (raw ?? {}) as InteractionResponse
+  const texts: string[] = []
+  const words: TranscriptWord[] = []
+  for (const step of body.steps ?? []) {
+    if (step.type && step.type !== 'model_output') continue
+    for (const c of step.content ?? []) {
+      if (c.type && c.type !== 'text') continue
+      if (c.text) texts.push(c.text)
+      for (const a of c.annotations ?? []) {
+        if (a.type !== 'word_info' || typeof a.text !== 'string') continue
+        const sp = typeof a.speaker === 'string' ? speakerLabel(a.speaker) : undefined
+        words.push({ text: a.text, start: seconds(a.start_offset), end: seconds(a.end_offset), ...(sp ? { speaker: sp } : {}) })
+      }
+    }
+  }
+  return { text: texts.join('\n').trim(), words }
+}
+
+async function errorOf(res: Response, model: string): Promise<Error> {
+  const raw = await res.text().catch(() => '')
+  let msg = raw.slice(0, 300)
+  try {
+    msg = (JSON.parse(raw) as { error?: { message?: string } }).error?.message ?? msg
+  } catch {
+    // не JSON — как есть
+  }
+  return statusError(`listen: ${model} HTTP ${res.status}${msg ? ` — ${msg}` : ''}`, res.status)
+}
+
+export function createGeminiTranscriber(o: GeminiTranscriberOpts): SttEngine {
+  const model = o.model || TRANSCRIBE_MODEL
+  const url = `${rootOf(o.baseUrl)}/v1beta/interactions`
+  const http = o.fetch ?? fetch
+  const retries = o.retries ?? 3
+  const maxWait = o.maxRetryWait ?? 30_000
+  const sleep = o.sleep ?? abortableSleep
+
+  return {
+    kind: 'studio',
+    model,
+    async transcribe(audio, opts = {}) {
+      const body = transcribeBody(audio, model, opts)
+      const vocabulary = ((body.generation_config as { transcription_config?: { custom_vocabulary?: string[] } } | undefined)?.transcription_config?.custom_vocabulary ?? []).length
+      const payload = JSON.stringify(body)
+      let res: Response
+      for (let attempt = 0; ; attempt++) {
+        res = await http(url, { method: 'POST', headers: { 'x-goog-api-key': o.apiKey, 'content-type': 'application/json' }, body: payload, ...(opts.signal ? { signal: opts.signal } : {}) })
+        if (res.status !== 429) break
+        const text = await res.clone().text().catch(() => '')
+        const wait = retryDelay(text)
+        if (/PerDay/i.test(text) || attempt >= retries || wait > maxWait) break
+        await sleep(wait, opts.signal)
+      }
+      if (!res.ok) throw await errorOf(res, model)
+      const data = (await res.json()) as InteractionResponse
+      if (data.error) throw statusError(`listen: ${model} — ${data.error.message ?? 'ошибка провайдера'}`, 502)
+      if (data.status && data.status !== 'completed') throw statusError(`listen: ${model} — статус «${data.status}»`, 502)
+      const { text, words } = parseInteraction(data)
+      const timed = !!(opts.segments || opts.diarize)
+      const language = opts.language || guessLanguage(text)
+      return {
+        text,
+        ...(language ? { language } : {}),
+        ...(timed ? { words, segments: segmentsOf(words) } : {}),
+        model,
+        vocabulary,
+      }
+    },
+  }
+}
+
+/** Mime по сигнатуре байтов: что модель берёт как есть; нет — перекодировать (ffmpeg). */
+export function sniffAudio(b: Uint8Array): string | undefined {
+  const at = (i: number, s: string): boolean => [...s].every((ch, k) => b[i + k] === ch.charCodeAt(0))
+  if (at(0, 'RIFF') && at(8, 'WAVE')) return 'audio/wav'
+  if (at(0, 'ID3')) return 'audio/mp3'
+  if (at(0, 'OggS')) return 'audio/ogg'
+  if (at(0, 'fLaC')) return 'audio/flac'
+  if (at(0, 'FORM') && (at(8, 'AIFF') || at(8, 'AIFC'))) return 'audio/aiff'
+  if (b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return 'audio/webm'
+  if (at(4, 'ftyp')) return /^(M4A |M4B |mp42|isom|dash|iso[2-6])/.test(String.fromCharCode(...b.subarray(8, 12))) ? 'audio/m4a' : undefined
+  if (b[0] === 0xff && b[1] !== undefined) {
+    if ((b[1] & 0xf6) === 0xf0) return 'audio/aac' // ADTS
+    if ((b[1] & 0xe0) === 0xe0) return 'audio/mp3' // кадр MPEG без ID3
+  }
+  return undefined
+}
