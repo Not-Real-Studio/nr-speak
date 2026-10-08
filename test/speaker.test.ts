@@ -29,9 +29,14 @@ describe('speaker', () => {
     expect((await s.key('Привет', {}, 'mp3')).key).not.toBe(a.key)
   })
 
-  it('один кусок разом дважды — один синтез', async () => {
+  it('один кусок разом дважды — один синтез (идущий — общий, готовый — из кэша)', async () => {
     const v = mockEngine({ kind: 'vertex' })
-    const s = createSpeaker({ engines: { vertex: v.engine }, defaultVoice: 'vertex:Kore' })
+    const slow = v.engine.speak
+    v.engine.speak = async function* (...a) {
+      await new Promise((r) => setTimeout(r, 20))
+      yield* slow(...a)
+    }
+    const s = createSpeaker({ engines: { vertex: v.engine }, defaultVoice: 'vertex:Kore', cache: memCache() })
     const [a, b] = await Promise.all([s.synth('x', {}, 'pcm'), s.synth('x', {}, 'pcm')])
     expect(dec(a.data)).toBe(dec(b.data))
     expect(v.calls.length).toBe(1)
