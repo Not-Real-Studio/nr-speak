@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { alignWords, createGeminiTranscriber, guessLanguage, mergeVocabulary, parseInteraction, segmentsOf, sniffAudio, speakerLabel, transcribeBody } from '../src/index.js'
-import { createListener, ffprobeOf, listenModelOf, listenerFromCtx } from '../src/node/index.js'
+import { createListener, ffprobeOf, listenModelOf, listenerFromCtx, truncatedAt } from '../src/node/index.js'
 import { fakeCtx, json } from './helpers.js'
 
 const bytes = (s: string, pad = 16): Uint8Array => {
@@ -48,6 +48,11 @@ describe('stt: ответ', () => {
     ])
     expect(speakerLabel('spk:2')).toBe('C')
     expect(speakerLabel('x')).toBe('x')
+  })
+
+  it('слитные реплики диаризации — пробел после конца предложения', () => {
+    expect(parseInteraction(interaction('Дальше L1 и стриминг.Всё верно!Да')).text).toBe('Дальше L1 и стриминг. Всё верно! Да')
+    expect(parseInteraction(interaction('версия 3.5 и v2.Ok, Node.JS')).text).toBe('версия 3.5 и v2. Ok, Node.JS')
   })
 
   it('сегменты: смена спикера, конец предложения, пауза, потолок слов', () => {
@@ -200,5 +205,25 @@ describe('stt: node', () => {
     const body = JSON.parse(String(seen.find((s) => s.url.endsWith('/interactions'))!.body)) as { input: unknown[] }
     expect(body.input).toEqual([{ type: 'audio', uri: 'https://g/files/abc', mime_type: 'audio/mp3' }])
     expect(seen.at(-1)).toMatchObject({ url: 'https://generativelanguage.googleapis.com/v1beta/files/abc', method: 'DELETE' })
+  })
+
+  it('обрыв ответа с таймстемпами: последнее слово сильно раньше конца звука — повтор, лучший из двух; не помог — truncated', async () => {
+    expect(truncatedAt({ text: '', model: 'm', vocabulary: 0, words: [{ text: 'x', start: 0, end: 199 }] }, 304)).toBe(true)
+    expect(truncatedAt({ text: '', model: 'm', vocabulary: 0, words: [{ text: 'x', start: 0, end: 295 }] }, 304)).toBe(false)
+    expect(truncatedAt({ text: '', model: 'm', vocabulary: 0 }, 304)).toBe(false)
+    const ends = [199, 303]
+    let calls = 0
+    const fetchMock = (async () => json(interaction('Слово.', [word('Слово.', 0, ends[calls++] ?? 100, 'spk:0')]))) as unknown as typeof fetch
+    const l = createListener({ apiKey: 'k', fetch: fetchMock, duration: async () => 304 })
+    const t = await l.transcribe(bytes('ID3\x04'), { diarize: true })
+    expect(calls).toBe(2)
+    expect(t).toMatchObject({ attempts: 2, duration: 304 })
+    expect(t.truncated).toBeUndefined()
+    expect(t.segments?.[0]?.end).toBe(303)
+    calls = 0
+    ends.splice(0, 2, 150, 120)
+    const bad = await l.transcribe(bytes('ID3\x04'), { diarize: true })
+    expect(bad).toMatchObject({ attempts: 2, truncated: true })
+    expect(bad.segments?.[0]?.end).toBe(150)
   })
 })

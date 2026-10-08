@@ -189,7 +189,8 @@ export function parseInteraction(raw: unknown): { text: string; words: Transcrip
       }
     }
   }
-  return { text: texts.join('\n').trim(), words }
+  // С диаризацией реплики приходят слитно («стриминг.Всё верно») — пробел после конца предложения.
+  return { text: texts.join('\n').trim().replace(/([\p{Ll}\p{N}][.!?…])(?=\p{Lu}\p{Ll})/gu, '$1 '), words }
 }
 
 async function errorOf(res: Response, model: string): Promise<Error> {

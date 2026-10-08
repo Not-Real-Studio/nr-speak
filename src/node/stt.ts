@@ -126,7 +126,29 @@ export interface Listener {
   /** Модель с префиксом провайдера (`studio:gemini-3.5-transcribe`). */
   model: string
   /** Распознать байты любого формата: подготовка, inline или Files API (файл удаляется после). */
-  transcribe(data: Uint8Array, opts?: TranscribeOpts & { name?: string }): Promise<Transcript & { converted: boolean; uploaded: boolean }>
+  transcribe(data: Uint8Array, opts?: TranscribeOpts & { name?: string }): Promise<Listened>
+}
+
+export interface Listened extends Transcript {
+  /** Перекодирован ffmpeg; ушёл через Files API. */
+  converted: boolean
+  uploaded: boolean
+  /** Длительность звука, с, если задан `duration`. */
+  duration?: number | undefined
+  /** Слова с таймстемпами не дошли до конца звука и после повтора (обрыв ответа модели). */
+  truncated?: boolean | undefined
+  /** Запросов к модели (повтор при обрыве — 2). */
+  attempts: number
+}
+
+/**
+ * Ответ с таймстемпами оборван: последнее слово раньше конца звука больше чем на
+ * max(15 с, 10 %). Модель (08.10.2026) изредка отдаёт `completed` с половиной слов.
+ */
+export function truncatedAt(t: Transcript, duration: number | undefined): boolean {
+  const last = t.words?.at(-1)?.end
+  if (!duration || last === undefined) return false
+  return last < duration - Math.max(15, duration * 0.1)
 }
 
 export interface ListenerOpts {
@@ -136,6 +158,8 @@ export interface ListenerOpts {
   inlineMax?: number | undefined
   /** Модель вместо `$listen_model` (`studio:…` или голое имя). */
   model?: string | undefined
+  /** Длительность звука, с (лог, verbose_json, проверка обрыва) — `audioDuration` с ffprobe; нет — без неё. */
+  duration?: ((data: Uint8Array) => Promise<number | undefined>) | undefined
 }
 
 /** `studio:gemini-3.5-transcribe` → имя модели; другой провайдер — ошибка (пока есть только studio). */
@@ -166,12 +190,22 @@ export function createListener(o: ListenerOpts & { apiKey: string; baseUrl?: str
     model: `studio:${engine.model}`,
     async transcribe(raw, opts = {}) {
       const a = await prepareAudio(raw, o.ffmpeg)
-      if (a.data.length <= inlineMax) return { ...(await engine.transcribe({ data: a.data, mime: a.mime }, opts)), converted: a.converted, uploaded: false }
-      const f = await uploadFile(files, a.data, a.mime, opts.name ?? 'speak-listen')
+      const durationP = o.duration ? o.duration(a.data).catch(() => undefined) : Promise.resolve(undefined)
+      const uploaded = a.data.length > inlineMax
+      const f = uploaded ? await uploadFile(files, a.data, a.mime, opts.name ?? 'speak-listen') : undefined
       try {
-        return { ...(await engine.transcribe({ uri: f.uri, mime: a.mime }, opts)), converted: a.converted, uploaded: true }
+        const input = f ? { uri: f.uri, mime: a.mime } : { data: a.data, mime: a.mime }
+        const [first, duration] = await Promise.all([engine.transcribe(input, opts), durationP])
+        let t = first
+        let attempts = 1
+        if (truncatedAt(t, duration)) {
+          attempts++
+          const again = await engine.transcribe(input, opts)
+          if ((again.words?.at(-1)?.end ?? 0) > (t.words?.at(-1)?.end ?? 0)) t = again
+        }
+        return { ...t, converted: a.converted, uploaded, attempts, ...(duration !== undefined ? { duration } : {}), ...(truncatedAt(t, duration) ? { truncated: true } : {}) }
       } finally {
-        await deleteFile(files, f.name).catch(() => {})
+        if (f) await deleteFile(files, f.name).catch(() => {})
       }
     },
   }
