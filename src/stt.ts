@@ -289,7 +289,7 @@ export interface VertexTranscriberOpts {
   tokenTtl?: number | undefined
   now?: (() => number) | undefined
   fetch?: typeof fetch | undefined
-  /** Повторы 429 (общая квота Vertex — «Resource has been exhausted»), по умолчанию 2. */
+  /** Повторы 429 (квота Vertex — токены звука в минуту, «Resource has been exhausted»), по умолчанию 3. */
   retries?: number | undefined
   maxRetryWait?: number | undefined
   sleep?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined
@@ -338,7 +338,7 @@ export function createVertexTranscriber(o: VertexTranscriberOpts): SttEngine {
   const location = o.location || 'global'
   const url = `${o.baseUrl ? rootOf(o.baseUrl) : vertexRoot(location)}/v1beta1/projects/${encodeURIComponent(o.project)}/locations/${encodeURIComponent(location)}/publishers/google/models/${model}:generateContent`
   const http = o.fetch ?? fetch
-  const retries = o.retries ?? 2
+  const retries = o.retries ?? 3
   const maxWait = o.maxRetryWait ?? 30_000
   const sleep = o.sleep ?? abortableSleep
   const token = vertexToken(o.token, o.tokenTtl, o.now)
@@ -359,8 +359,9 @@ export function createVertexTranscriber(o: VertexTranscriberOpts): SttEngine {
         continue
       }
       if (res.status !== 429) break
-      const wait = retryDelay(await res.clone().text().catch(() => ''))
-      if (attempt >= retries || wait > maxWait) break
+      // Срока Vertex не называет; лимит — токены звука в минуту: паузы нарастают 2, 6, 18 с.
+      const wait = Math.min(maxWait, 2000 * 3 ** attempt)
+      if (attempt >= retries) break
       attempt++
       await sleep(wait, opts.signal)
     }
