@@ -160,6 +160,8 @@ export interface ListenerOpts {
   inlineMax?: number | undefined
   /** Модель вместо `$listen_model` (`studio:…` или голое имя). */
   model?: string | undefined
+  /** Повторы 429 у провайдера (по умолчанию — у движка); 0 — сразу ошибка (есть фолбэк). */
+  retries?: number | undefined
   /** Длительность звука, с (лог, verbose_json, проверка обрыва) — `audioDuration` с ffprobe; нет — без неё. */
   duration?: ((data: Uint8Array) => Promise<number | undefined>) | undefined
 }
@@ -191,7 +193,7 @@ export function listenerFromCtx(ctx: unknown, o: ListenerOpts & { token?: (() =>
     const pname = (speakOpt(ctx, 'vertex_provider') as string | undefined)?.toString().trim() || 'vertex'
     const p = providerOf(ctx, pname)
     if (!isVertex(p) || !p.project) throw new Error(`listen: нет Vertex ($project в ## $provider ${pname} ~/.runz/config.md)`)
-    const stt = createVertexTranscriber({ project: p.project, ...(p.location ? { location: p.location } : {}), ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), token: o.token ?? gcloudToken(p.gcloud), model, ...(o.fetch ? { fetch: o.fetch } : {}) })
+    const stt = createVertexTranscriber({ project: p.project, ...(p.location ? { location: p.location } : {}), ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), token: o.token ?? gcloudToken(p.gcloud), model, ...(o.fetch ? { fetch: o.fetch } : {}), ...(o.retries !== undefined ? { retries: o.retries } : {}) })
     return listenerOver(stt, 'vertex', o)
   }
   const pname = (speakOpt(ctx, 'studio_provider') as string | undefined)?.toString().trim() || 'google'
@@ -203,7 +205,7 @@ export function listenerFromCtx(ctx: unknown, o: ListenerOpts & { token?: (() =>
 /** Транскрибер AI Studio: большой звук — через Files API. */
 export function createListener(o: ListenerOpts & { apiKey: string; baseUrl?: string | undefined; model?: string | undefined }): Listener {
   const files: FilesApiOpts = { apiKey: o.apiKey, ...(o.baseUrl ? { baseUrl: o.baseUrl } : {}), ...(o.fetch ? { fetch: o.fetch } : {}) }
-  return listenerOver(createGeminiTranscriber({ ...files, ...(o.model ? { model: o.model } : {}) }), 'studio', o, files)
+  return listenerOver(createGeminiTranscriber({ ...files, ...(o.model ? { model: o.model } : {}), ...(o.retries !== undefined ? { retries: o.retries } : {}) }), 'studio', o, files)
 }
 
 /**
