@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { alignWords, createGeminiTranscriber, guessLanguage, mergeVocabulary, parseInteraction, segmentsOf, sniffAudio, speakerLabel, transcribeBody } from '../src/index.js'
-import { createListener, ffprobeOf, listenModelOf, listenerFromCtx, truncatedAt } from '../src/node/index.js'
+import { alignWords, createGeminiTranscriber, createVertexTranscriber, guessLanguage, mergeVocabulary, parseInteraction, parseVertex, segmentsOf, sniffAudio, speakerLabel, transcribeBody, vertexTranscribeBody } from '../src/index.js'
+import { createListener, ffprobeOf, listenModelOf, listenerFromCtx, parseListenModel, truncatedAt } from '../src/node/index.js'
 import { fakeCtx, json } from './helpers.js'
 
 const bytes = (s: string, pad = 16): Uint8Array => {
@@ -170,11 +170,24 @@ describe('stt: формат звука', () => {
 })
 
 describe('stt: node', () => {
-  it('модель: studio:… → имя, голое — как есть, пусто — по умолчанию, чужой движок — ошибка', () => {
+  it('модель: studio:/vertex: → движок и имя, голое — studio, пусто — по умолчанию, чужой движок — ошибка', () => {
     expect(listenModelOf('studio:gemini-3.5-transcribe')).toBe('gemini-3.5-transcribe')
     expect(listenModelOf(undefined)).toBe('gemini-3.5-transcribe')
     expect(listenModelOf('x-model')).toBe('x-model')
-    expect(() => listenModelOf('vertex:gemini-3.5-transcribe')).toThrow(/не поддержан/)
+    expect(parseListenModel('vertex:gemini-3.5-transcribe')).toEqual({ engine: 'vertex', model: 'gemini-3.5-transcribe' })
+    expect(parseListenModel('vertex:')).toEqual({ engine: 'vertex', model: 'gemini-3.5-transcribe-preview' })
+    expect(() => listenModelOf('openai:whisper-1')).toThrow(/не поддержан/)
+  })
+
+  it('из конфига: vertex: — проект провайдера vertex, токен; без проекта — ошибка', () => {
+    const l = listenerFromCtx(fakeCtx({ provider: { vertex: { type: 'vertex', project: 'p1' } } }), { model: 'vertex:gemini-3.5-transcribe-preview', token: async () => 't' })
+    expect(l.model).toBe('vertex:gemini-3.5-transcribe-preview')
+    expect(() => listenerFromCtx(fakeCtx({}), { model: 'vertex:x' })).toThrow(/нет Vertex/)
+  })
+
+  it('vertex: inline-потолок — 413 без Files API', async () => {
+    const l = listenerFromCtx(fakeCtx({ provider: { vertex: { type: 'vertex', project: 'p1' } } }), { model: 'vertex:', token: async () => 't', inlineMax: 4, fetch: (async () => json({})) as typeof fetch })
+    await expect(l.transcribe(bytes('ID3', 64))).rejects.toMatchObject({ status: 413 })
   })
 
   it('ffprobe рядом с ffmpeg', () => {
@@ -225,5 +238,76 @@ describe('stt: node', () => {
     const bad = await l.transcribe(bytes('ID3\x04'), { diarize: true })
     expect(bad).toMatchObject({ attempts: 2, truncated: true })
     expect(bad.segments?.[0]?.end).toBe(150)
+  })
+})
+
+describe('stt: vertex', () => {
+  const vresp = (parts: unknown[]) => ({ candidates: [{ content: { role: 'model', parts }, finishReason: 'STOP' }] })
+  const vword = (word: string, s: number, e: number) => ({ word, startOffset: `${s}s`, endOffset: `${e}s` })
+
+  it('тело: inlineData, languageCodes, customVocabulary; сегменты — wordTimestamp/diarization без словаря; uri — 413', () => {
+    expect(vertexTranscribeBody({ data: new TextEncoder().encode('AUDIO'), mime: 'audio/mp3' }, { language: 'ru', vocabulary: ['runz'] })).toEqual({
+      contents: [{ role: 'user', parts: [{ inlineData: { data: 'QVVESU8=', mimeType: 'audio/mp3' } }] }],
+      generationConfig: { audioTranscriptionConfig: { languageCodes: ['ru'], customVocabulary: ['runz'] } },
+    })
+    const d = vertexTranscribeBody({ data: new Uint8Array(1), mime: 'audio/wav' }, { diarize: true, vocabulary: ['runz'] })
+    expect(d.generationConfig).toEqual({ audioTranscriptionConfig: { wordTimestamp: true, diarization: true } })
+    expect(() => vertexTranscribeBody({ uri: 'https://x', mime: 'audio/mp3' })).toThrow(/inline/)
+  })
+
+  it('ответ: реплики по частям, speakerLabel → A/B, слова со временем', () => {
+    const r = parseVertex(vresp([
+      { text: 'Привет.', audioTranscription: { text: 'Привет.', speakerLabel: 'spk:0', words: [vword('Привет.', 0.2, 1)] } },
+      { text: 'Да.', audioTranscription: { text: 'Да.', speakerLabel: 'spk:1', words: [vword('Да.', 1.5, 1.8)] } },
+    ]))
+    expect(r.text).toBe('Привет.\nДа.')
+    expect(r.words).toEqual([
+      { text: 'Привет.', start: 0.2, end: 1, speaker: 'A' },
+      { text: 'Да.', start: 1.5, end: 1.8, speaker: 'B' },
+    ])
+    expect(parseVertex(vresp([{ text: 'Только текст' }]))).toEqual({ text: 'Только текст', words: [] })
+  })
+
+  it('запрос: URL global, Bearer и x-goog-user-project; 401 — свежий токен; 429 — повтор', async () => {
+    const calls: { url: string; auth: string; project: string }[] = []
+    let n = 0
+    const tokens = ['old', 'new']
+    const fetchMock = (async (url: string, init: RequestInit = {}) => {
+      const h = init.headers as Record<string, string>
+      calls.push({ url, auth: h.authorization!, project: h['x-goog-user-project']! })
+      n++
+      if (n === 1) return new Response('{}', { status: 401 })
+      if (n === 2) return json({ error: { code: 429, message: 'Resource has been exhausted (e.g. check quota).' } }, 429)
+      return json(vresp([{ text: 'Готово', audioTranscription: { text: 'Готово' } }]))
+    }) as typeof fetch
+    const stt = createVertexTranscriber({ project: 'p1', token: async () => tokens.shift()!, fetch: fetchMock, sleep: async () => {} })
+    const t = await stt.transcribe({ data: new Uint8Array([1]), mime: 'audio/mp3' }, { vocabulary: ['runz'] })
+    expect(t).toMatchObject({ text: 'Готово', model: 'gemini-3.5-transcribe-preview', vocabulary: 1 })
+    expect(calls[0]!.url).toBe('https://aiplatform.googleapis.com/v1beta1/projects/p1/locations/global/publishers/google/models/gemini-3.5-transcribe-preview:generateContent')
+    expect(calls.map((c) => c.auth)).toEqual(['Bearer old', 'Bearer new', 'Bearer new'])
+    expect(calls[0]!.project).toBe('p1')
+  })
+
+  it('ошибка провайдера — со статусом; 429 сверх повторов — 429', async () => {
+    const e404 = createVertexTranscriber({ project: 'p', token: async () => 't', fetch: (async () => json({ error: { code: 404, message: 'not found' } }, 404)) as typeof fetch })
+    await expect(e404.transcribe({ data: new Uint8Array([1]), mime: 'audio/mp3' })).rejects.toMatchObject({ status: 404 })
+    const e429 = createVertexTranscriber({ project: 'p', token: async () => 't', retries: 1, sleep: async () => {}, fetch: (async () => json({ error: { message: 'exhausted' } }, 429)) as typeof fetch })
+    await expect(e429.transcribe({ data: new Uint8Array([1]), mime: 'audio/mp3' })).rejects.toMatchObject({ status: 429 })
+  })
+
+  it('словарь с диаризацией — два прохода, как у Studio', async () => {
+    const bodies: Record<string, unknown>[] = []
+    const fetchMock = (async (_url: string, init: RequestInit = {}) => {
+      const b = JSON.parse(String(init.body)) as { generationConfig?: { audioTranscriptionConfig?: { diarization?: boolean } } }
+      bodies.push(b)
+      return b.generationConfig?.audioTranscriptionConfig?.diarization
+        ? json(vresp([{ text: 'Привет Сулафат', audioTranscription: { text: 'Привет Сулафат', speakerLabel: 'spk:0', words: [vword('Привет', 0, 0.5), vword('Сулафат', 0.6, 1.2)] } }]))
+        : json(vresp([{ text: 'Привет Sulafat', audioTranscription: { text: 'Привет Sulafat' } }]))
+    }) as typeof fetch
+    const stt = createVertexTranscriber({ project: 'p', token: async () => 't', fetch: fetchMock })
+    const t = await stt.transcribe({ data: new Uint8Array([1]), mime: 'audio/mp3' }, { diarize: true, vocabulary: ['Sulafat'] })
+    expect(bodies).toHaveLength(2)
+    expect(t.text).toBe('Привет Sulafat')
+    expect(t.segments).toEqual([{ start: 0, end: 1.2, text: 'Привет Sulafat', speaker: 'A' }])
   })
 })

@@ -9,9 +9,15 @@
  * диаризацией и таймстемпами («custom_vocabulary is incompatible with …»), а диаризация без
  * таймстемпов не отдаёт слов — поэтому сегменты со словарём — два прохода разом (текст со
  * словарём + слова с временем и спикерами без него) и выравнивание слов (`alignWords`).
+ *
+ * Та же модель на Vertex AI (DEV-258, фолбэк при исчерпанной квоте AI Studio) —
+ * `createVertexTranscriber`: `generateContent` с `generationConfig.audioTranscriptionConfig`
+ * (`customVocabulary`, `languageCodes`, `wordTimestamp`, `diarization`), OAuth-токен проекта.
+ * Словарь с диаризацией Vertex принимает, но (09.10.2026) теряет половину текста — та же схема
+ * двух проходов. Файлов Vertex не берёт (нужен gs://) — только inline.
  */
 
-import { retryDelay } from './gemini.js'
+import { retryDelay, vertexRoot, vertexToken } from './gemini.js'
 import { abortableSleep, statusError } from './types.js'
 
 export const TRANSCRIBE_MODEL = 'gemini-3.5-transcribe'
@@ -231,33 +237,141 @@ export function createGeminiTranscriber(o: GeminiTranscriberOpts): SttEngine {
     return parseInteraction(data)
   }
 
-  return {
-    kind: 'studio',
-    model,
-    async transcribe(audio, opts = {}) {
-      const timed = !!(opts.segments || opts.diarize)
-      const vocab = mergeVocabulary(opts.vocabulary)
-      let text: string
-      let words: TranscriptWord[] = []
-      if (timed && vocab.length) {
-        // Словарь с таймстемпами провайдер не совмещает — два прохода разом: текст со словарём,
-        // слова с временем и спикерами без него; время и спикеры переносятся на текст выравниванием.
-        const [a, b] = await Promise.all([once(audio, { ...opts, segments: false, diarize: false, vocabulary: vocab }), once(audio, { ...opts, vocabulary: [] })])
-        text = a.text
-        words = alignWords(a.text, b.words)
-      } else {
-        ;({ text, words } = await once(audio, { ...opts, vocabulary: vocab }))
-      }
-      const language = opts.language || guessLanguage(text)
-      return {
-        text,
-        ...(language ? { language } : {}),
-        ...(timed ? { words, segments: segmentsOf(words) } : {}),
-        model,
-        vocabulary: vocab.length,
-      }
-    },
+  return { kind: 'studio', model, transcribe: (audio, opts = {}) => transcribeWith(once, model, audio, opts) }
+}
+
+/**
+ * Распознавание поверх одного запроса `once`: словарь с сегментами — два прохода разом (текст со
+ * словарём, слова с временем и спикерами без него) и выравнивание; язык — заданный или по тексту.
+ */
+async function transcribeWith(
+  once: (audio: AudioInput, opts: TranscribeOpts) => Promise<{ text: string; words: TranscriptWord[] }>,
+  model: string,
+  audio: AudioInput,
+  opts: TranscribeOpts,
+): Promise<Transcript> {
+  const timed = !!(opts.segments || opts.diarize)
+  const vocab = mergeVocabulary(opts.vocabulary)
+  let text: string
+  let words: TranscriptWord[] = []
+  if (timed && vocab.length) {
+    const [a, b] = await Promise.all([once(audio, { ...opts, segments: false, diarize: false, vocabulary: vocab }), once(audio, { ...opts, vocabulary: [] })])
+    text = a.text
+    words = alignWords(a.text, b.words)
+  } else {
+    ;({ text, words } = await once(audio, { ...opts, vocabulary: vocab }))
   }
+  const language = opts.language || guessLanguage(text)
+  return {
+    text,
+    ...(language ? { language } : {}),
+    ...(timed ? { words, segments: segmentsOf(words) } : {}),
+    model,
+    vocabulary: vocab.length,
+  }
+}
+
+// --- Vertex AI ---
+
+/** Модель на Vertex: GA-имя `gemini-3.5-transcribe` проекту (09.10.2026) отвечает 404, preview — работает. */
+export const VERTEX_TRANSCRIBE_MODEL = 'gemini-3.5-transcribe-preview'
+
+export interface VertexTranscriberOpts {
+  /** Проект GCP (он же `x-goog-user-project`). */
+  project: string
+  /** Регион; модель есть в `global` (по умолчанию). */
+  location?: string | undefined
+  /** Подмена корня API (тесты, прокси). */
+  baseUrl?: string | undefined
+  model?: string | undefined
+  /** Свежий OAuth-токен (ADC); кэшируется на `tokenTtl`. */
+  token: () => Promise<string>
+  tokenTtl?: number | undefined
+  now?: (() => number) | undefined
+  fetch?: typeof fetch | undefined
+  /** Повторы 429 (общая квота Vertex — «Resource has been exhausted»), по умолчанию 2. */
+  retries?: number | undefined
+  maxRetryWait?: number | undefined
+  sleep?: ((ms: number, signal?: AbortSignal) => Promise<void>) | undefined
+}
+
+/** Тело Vertex `generateContent`. Сегменты — без словаря (как у Studio, см. шапку). */
+export function vertexTranscribeBody(audio: AudioInput, o: TranscribeOpts = {}): Record<string, unknown> {
+  if ('uri' in audio) throw statusError('listen: Vertex не берёт файлы Files API — только inline', 413)
+  const timed = !!(o.segments || o.diarize)
+  const cfg: Record<string, unknown> = {}
+  if (o.language) cfg.languageCodes = [o.language]
+  const vocab = timed ? [] : mergeVocabulary(o.vocabulary)
+  if (vocab.length) cfg.customVocabulary = vocab
+  if (timed) cfg.wordTimestamp = true
+  if (o.diarize) cfg.diarization = true
+  return {
+    contents: [{ role: 'user', parts: [{ inlineData: { data: b64encode(audio.data), mimeType: audio.mime } }] }],
+    ...(Object.keys(cfg).length ? { generationConfig: { audioTranscriptionConfig: cfg } } : {}),
+  }
+}
+
+interface VertexResponse {
+  candidates?: {
+    content?: { parts?: { text?: string; audioTranscription?: { text?: string; speakerLabel?: string; words?: { word?: string; startOffset?: unknown; endOffset?: unknown }[] } }[] }
+    finishReason?: string
+  }[]
+}
+
+/** Ответ Vertex → текст и слова: часть — реплика (`speakerLabel` у диаризации), слова — `words`. */
+export function parseVertex(raw: unknown): { text: string; words: TranscriptWord[] } {
+  const texts: string[] = []
+  const words: TranscriptWord[] = []
+  for (const c of ((raw ?? {}) as VertexResponse).candidates?.slice(0, 1) ?? [])
+    for (const p of c.content?.parts ?? []) {
+      const a = p.audioTranscription
+      const t = a?.text ?? p.text
+      if (t) texts.push(t)
+      const sp = a?.speakerLabel ? speakerLabel(a.speakerLabel) : undefined
+      for (const w of a?.words ?? []) if (typeof w.word === 'string') words.push({ text: w.word, start: seconds(w.startOffset), end: seconds(w.endOffset), ...(sp ? { speaker: sp } : {}) })
+    }
+  return { text: texts.join('\n').trim(), words }
+}
+
+export function createVertexTranscriber(o: VertexTranscriberOpts): SttEngine {
+  const model = o.model || VERTEX_TRANSCRIBE_MODEL
+  const location = o.location || 'global'
+  const url = `${o.baseUrl ? rootOf(o.baseUrl) : vertexRoot(location)}/v1beta1/projects/${encodeURIComponent(o.project)}/locations/${encodeURIComponent(location)}/publishers/google/models/${model}:generateContent`
+  const http = o.fetch ?? fetch
+  const retries = o.retries ?? 2
+  const maxWait = o.maxRetryWait ?? 30_000
+  const sleep = o.sleep ?? abortableSleep
+  const token = vertexToken(o.token, o.tokenTtl, o.now)
+
+  async function once(audio: AudioInput, opts: TranscribeOpts): Promise<{ text: string; words: TranscriptWord[] }> {
+    const payload = JSON.stringify(vertexTranscribeBody(audio, opts))
+    let res: Response
+    let fresh = false
+    let reauthed = false
+    for (let attempt = 0; ; ) {
+      const headers = { authorization: `Bearer ${await token(fresh)}`, 'x-goog-user-project': o.project, 'content-type': 'application/json' }
+      fresh = false
+      res = await http(url, { method: 'POST', headers, body: payload, ...(opts.signal ? { signal: opts.signal } : {}) })
+      if (res.status === 401 && !reauthed) {
+        // Токен протух раньше срока кэша — одно обновление и повтор.
+        await res.body?.cancel().catch(() => {})
+        fresh = reauthed = true
+        continue
+      }
+      if (res.status !== 429) break
+      const wait = retryDelay(await res.clone().text().catch(() => ''))
+      if (attempt >= retries || wait > maxWait) break
+      attempt++
+      await sleep(wait, opts.signal)
+    }
+    if (!res.ok) throw await errorOf(res, `vertex:${model}`)
+    const data = (await res.json()) as VertexResponse
+    const reason = data.candidates?.[0]?.finishReason
+    if (reason && reason !== 'STOP') throw statusError(`listen: vertex:${model} — finishReason «${reason}»`, 502)
+    return parseVertex(data)
+  }
+
+  return { kind: 'vertex', model, transcribe: (audio, opts = {}) => transcribeWith(once, model, audio, opts) }
 }
 
 const norm = (w: string): string => w.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')

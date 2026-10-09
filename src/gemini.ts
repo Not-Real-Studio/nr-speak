@@ -349,6 +349,27 @@ export function createGeminiEngine(o: GeminiOpts): TtsEngine {
   }
 }
 
+/**
+ * Токен Vertex с кэшем: на ~50 мин из часа жизни; один запрос за ним на всех ждущих;
+ * `fresh` — мимо кэша (после 401). Общий у озвучки и распознавания.
+ */
+export function vertexToken(get: () => Promise<string>, ttl = 50 * 60_000, now: () => number = Date.now): (fresh?: boolean) => Promise<string> {
+  let cached: { token: Promise<string>; at: number } | null = null
+  return (fresh = false) => {
+    if (fresh || !cached || now() - cached.at >= ttl) {
+      const p = get().then((t) => {
+        if (!t.trim()) throw new Error('voice: пустой токен Vertex')
+        return t.trim()
+      })
+      cached = { token: p, at: now() }
+      p.catch(() => {
+        if (cached?.token === p) cached = null
+      })
+    }
+    return cached.token
+  }
+}
+
 /** Корень Vertex AI: `global` — без региона в хосте. */
 export function vertexRoot(location: string): string {
   return location === 'global' ? 'https://aiplatform.googleapis.com' : `https://${location}-aiplatform.googleapis.com`
@@ -366,21 +387,7 @@ export function createVertexEngine(o: VertexOpts): TtsEngine {
   const ttl = o.tokenTtl ?? 50 * 60_000
   const now = o.now ?? Date.now
   const url = `${o.baseUrl ? geminiRoot(o.baseUrl) : vertexRoot(location)}/v1/projects/${encodeURIComponent(o.project)}/locations/${encodeURIComponent(location)}/publishers/google/models/${model}:streamGenerateContent?alt=sse`
-  // Токен — на ~50 мин из часа жизни; один запрос за ним на всех ждущих.
-  let cached: { token: Promise<string>; at: number } | null = null
-  const token = (fresh: boolean): Promise<string> => {
-    if (fresh || !cached || now() - cached.at >= ttl) {
-      const p = o.token().then((t) => {
-        if (!t.trim()) throw new Error('voice: пустой токен Vertex')
-        return t.trim()
-      })
-      cached = { token: p, at: now() }
-      p.catch(() => {
-        if (cached?.token === p) cached = null
-      })
-    }
-    return cached.token
-  }
+  const token = vertexToken(o.token, ttl, now)
 
   return {
     kind: 'vertex',

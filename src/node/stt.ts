@@ -1,7 +1,8 @@
 /**
  * Речь → текст, Node-половина (DEV-252): звук любого формата → поддерживаемый (ffmpeg),
  * маленький — inline, большой (митинги) — Files API Gemini; длительность — ffprobe;
- * транскрибер по конфигу runz (`## $speak` → `$listen_model`, ключ — провайдер AI Studio).
+ * транскрибер по конфигу runz (`## $speak` → `$listen_model`): `studio:` — ключ провайдера AI
+ * Studio, `vertex:` (DEV-258) — проект и токен провайдера Vertex, звук только inline.
  */
 
 import { execFile } from 'node:child_process'
@@ -10,8 +11,9 @@ import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join } from 'node:path'
 import type { FfmpegRun } from '../audio.js'
 import type { SttEngine, Transcript, TranscribeOpts } from '../stt.js'
-import { TRANSCRIBE_MODEL, createGeminiTranscriber, sniffAudio } from '../stt.js'
-import { isVertex, providerOf, speakOpt } from './config.js'
+import { TRANSCRIBE_MODEL, VERTEX_TRANSCRIBE_MODEL, createGeminiTranscriber, createVertexTranscriber, sniffAudio } from '../stt.js'
+import { statusError } from '../types.js'
+import { gcloudToken, isVertex, providerOf, speakOpt } from './config.js'
 
 /** Inline — до 14 МБ звука (base64 раздувает на треть, потолок запроса ~20 МБ); больше — Files API. */
 export const INLINE_MAX = 14 * 1024 * 1024
@@ -162,37 +164,63 @@ export interface ListenerOpts {
   duration?: ((data: Uint8Array) => Promise<number | undefined>) | undefined
 }
 
-/** `studio:gemini-3.5-transcribe` → имя модели; другой провайдер — ошибка (пока есть только studio). */
-export function listenModelOf(name: string | undefined): string {
+export const LISTEN_ENGINES = ['studio', 'vertex'] as const
+export type ListenEngine = (typeof LISTEN_ENGINES)[number]
+
+/** `studio:gemini-3.5-transcribe` → движок и модель; без префикса — studio; пусто — модель по умолчанию движка. */
+export function parseListenModel(name: string | undefined): { engine: ListenEngine; model: string } {
   const v = (name ?? '').trim()
-  if (!v) return TRANSCRIBE_MODEL
-  const m = /^([a-z]+):(.+)$/.exec(v)
-  if (!m) return v
-  if (m[1] !== 'studio') throw new Error(`listen: движок «${m[1]}» не поддержан — есть studio: (Gemini API, AI Studio)`)
-  return m[2]!
+  const m = /^([a-z]+):(.*)$/.exec(v)
+  if (!m) return { engine: 'studio', model: v || TRANSCRIBE_MODEL }
+  if (!(LISTEN_ENGINES as readonly string[]).includes(m[1]!)) throw new Error(`listen: движок «${m[1]}» не поддержан — есть studio: (Gemini API, AI Studio), vertex: (Vertex AI)`)
+  const engine = m[1] as ListenEngine
+  return { engine, model: m[2]!.trim() || (engine === 'vertex' ? VERTEX_TRANSCRIBE_MODEL : TRANSCRIBE_MODEL) }
 }
 
-/** Транскрибер по конфигу: ключ — провайдер AI Studio (`$studio_provider`, по умолчанию `google`). */
-export function listenerFromCtx(ctx: unknown, o: ListenerOpts = {}): Listener {
+/** Имя модели без префикса (`studio:x` → `x`); незнакомый движок — ошибка. */
+export const listenModelOf = (name: string | undefined): string => parseListenModel(name).model
+
+/**
+ * Транскрибер по конфигу: `studio:` — ключ провайдера AI Studio (`$studio_provider`, по умолчанию
+ * `google`); `vertex:` — провайдер Vertex (`$vertex_provider`, по умолчанию `vertex`: `$project`,
+ * `$location`, `$gcloud`).
+ */
+export function listenerFromCtx(ctx: unknown, o: ListenerOpts & { token?: (() => Promise<string>) | undefined } = {}): Listener {
+  const { engine, model } = parseListenModel(o.model ?? (speakOpt(ctx, 'listen_model') as string | undefined)?.toString())
+  if (engine === 'vertex') {
+    const pname = (speakOpt(ctx, 'vertex_provider') as string | undefined)?.toString().trim() || 'vertex'
+    const p = providerOf(ctx, pname)
+    if (!isVertex(p) || !p.project) throw new Error(`listen: нет Vertex ($project в ## $provider ${pname} ~/.runz/config.md)`)
+    const stt = createVertexTranscriber({ project: p.project, ...(p.location ? { location: p.location } : {}), ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), token: o.token ?? gcloudToken(p.gcloud), model, ...(o.fetch ? { fetch: o.fetch } : {}) })
+    return listenerOver(stt, 'vertex', o)
+  }
   const pname = (speakOpt(ctx, 'studio_provider') as string | undefined)?.toString().trim() || 'google'
   const p = providerOf(ctx, pname)
   if (!p.apiKey || isVertex(p)) throw new Error(`listen: нет ключа AI Studio ($api_key в ## $provider ${pname} ~/.runz/config.md)`)
-  const model = listenModelOf(o.model ?? (speakOpt(ctx, 'listen_model') as string | undefined)?.toString())
   return createListener({ ...o, apiKey: p.apiKey, ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), model })
 }
 
+/** Транскрибер AI Studio: большой звук — через Files API. */
 export function createListener(o: ListenerOpts & { apiKey: string; baseUrl?: string | undefined; model?: string | undefined }): Listener {
   const files: FilesApiOpts = { apiKey: o.apiKey, ...(o.baseUrl ? { baseUrl: o.baseUrl } : {}), ...(o.fetch ? { fetch: o.fetch } : {}) }
-  const engine = createGeminiTranscriber({ ...files, ...(o.model ? { model: o.model } : {}) })
+  return listenerOver(createGeminiTranscriber({ ...files, ...(o.model ? { model: o.model } : {}) }), 'studio', o, files)
+}
+
+/**
+ * Listener над движком: подготовка звука, длительность, повтор при обрыве. `files` — Files API
+ * для звука больше `inlineMax` (AI Studio); без него (Vertex) больше порога — 413.
+ */
+export function listenerOver(engine: SttEngine, prefix: string, o: ListenerOpts, files?: FilesApiOpts): Listener {
   const inlineMax = o.inlineMax ?? INLINE_MAX
   return {
     engine,
-    model: `studio:${engine.model}`,
+    model: `${prefix}:${engine.model}`,
     async transcribe(raw, opts = {}) {
       const a = await prepareAudio(raw, o.ffmpeg)
-      const durationP = o.duration ? o.duration(a.data).catch(() => undefined) : Promise.resolve(undefined)
       const uploaded = a.data.length > inlineMax
-      const f = uploaded ? await uploadFile(files, a.data, a.mime, opts.name ?? 'speak-listen') : undefined
+      if (uploaded && !files) throw statusError(`listen: ${prefix}:${engine.model} — звук ${Math.round(a.data.length / 1024 / 1024)} МБ, inline до ${Math.round(inlineMax / 1024 / 1024)} МБ`, 413)
+      const durationP = o.duration ? o.duration(a.data).catch(() => undefined) : Promise.resolve(undefined)
+      const f = uploaded && files ? await uploadFile(files, a.data, a.mime, opts.name ?? 'speak-listen') : undefined
       try {
         const input = f ? { uri: f.uri, mime: a.mime } : { data: a.data, mime: a.mime }
         const [first, duration] = await Promise.all([engine.transcribe(input, opts), durationP])
@@ -205,7 +233,7 @@ export function createListener(o: ListenerOpts & { apiKey: string; baseUrl?: str
         }
         return { ...t, converted: a.converted, uploaded, attempts, ...(duration !== undefined ? { duration } : {}), ...(truncatedAt(t, duration) ? { truncated: true } : {}) }
       } finally {
-        if (f) await deleteFile(files, f.name).catch(() => {})
+        if (f && files) await deleteFile(files, f.name).catch(() => {})
       }
     },
   }
