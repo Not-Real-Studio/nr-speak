@@ -83,15 +83,19 @@ ffmpeg, остальное — ffmpeg (`ffmpegArgs`, темп — `atempo`).
 ## Распознавание
 
 Обратное направление — речь → текст: Gemini 3.5 Transcribe (`gemini-3.5-transcribe`) через
-Gemini API (AI Studio, ключ), Interactions API `POST /v1beta/interactions`.
+Gemini API (AI Studio, ключ), Interactions API `POST /v1beta/interactions`; та же модель на
+Vertex AI (`createVertexTranscriber`, OAuth-токен проекта) — `generateContent` с
+`generationConfig.audioTranscriptionConfig`.
 
 ```ts
-import { createGeminiTranscriber } from '@notrealstudio/speak'
-import { listenerFromCtx, audioDuration, ffprobeOf, ffmpegRunner } from '@notrealstudio/speak/node'
+import { createGeminiTranscriber, createVertexTranscriber } from '@notrealstudio/speak'
+import { listenerFromCtx, audioDuration, ffprobeOf, ffmpegRunner, gcloudToken } from '@notrealstudio/speak/node'
 
 const stt = createGeminiTranscriber({ apiKey })                       // ядро: байты/uri → текст
 const t = await stt.transcribe({ data: mp3, mime: 'audio/mp3' }, { language: 'ru', vocabulary: ['runz', 'nrlib'] })
 // → { text, language, model, vocabulary: 2 }
+
+const vx = createVertexTranscriber({ project, token: gcloudToken() })  // gemini-3.5-transcribe-preview, global
 
 const listener = listenerFromCtx(ctx, { ffmpeg: ffmpegRunner(), duration: (d) => audioDuration(d, ffprobeOf()) })
 const m = await listener.transcribe(bytes, { diarize: true, vocabulary })   // любой формат, любой размер
@@ -106,8 +110,12 @@ const m = await listener.transcribe(bytes, { diarize: true, vocabulary })   // �
 
 `/node`: `prepareAudio` — неопознанное → mp3 через ffmpeg; до `INLINE_MAX` (14 МБ) — inline,
 больше — `uploadFile` (Files API, resumable) и `deleteFile` после; `audioDuration` — ffprobe
-по временному файлу; `listenerFromCtx(ctx)` — ключ `## $provider google` (`$studio_provider`),
-модель — `$listen_model` блока `## $speak` (`studio:gemini-3.5-transcribe`).
+по временному файлу; `listenerFromCtx(ctx, {model?, retries?})` — модель `$listen_model` блока
+`## $speak` или `model`: `studio:…` — ключ `## $provider google` (`$studio_provider`), `vertex:…` —
+`$project`/`$location`/`$gcloud` провайдера `## $provider vertex` (`$vertex_provider`), звук только
+inline (больше `INLINE_MAX` — ошибка 413). `parseListenModel('vertex:')` →
+`{engine: 'vertex', model: 'gemini-3.5-transcribe-preview'}`; `listenerOver(engine, prefix, opts)` —
+Listener над любым `SttEngine`. `retries: 0` — 429 сразу ошибкой (у потребителя есть фолбэк).
 
 ## Грабли
 
@@ -127,7 +135,14 @@ const m = await listener.transcribe(bytes, { diarize: true, vocabulary })   // �
   записи). `Listener` с `duration` сверяет последнее слово с длительностью и повторяет раз;
   не помогло — `truncated: true`. Реплики разных спикеров модель склеивает без пробела
   («стриминг.Всё») — `parseInteraction` вставляет его.
-- AI Studio Tier 1 — 10 запросов в минуту на модель; с таймстемпами — до 30 мин звука.
+- AI Studio Tier 1 — 10 запросов в минуту на модель и 100 в сутки; с таймстемпами — до 30 мин звука.
+- Transcribe на Vertex (09.10.2026): GA-имя `gemini-3.5-transcribe` проекту — 404 во всех
+  локациях, работает `gemini-3.5-transcribe-preview` в `global` (v1beta1). Interactions API у
+  Vertex модель не берёт («Unsupported model interaction»). Лимит — токены звука в минуту (~25
+  на секунду звука), 429 «Resource has been exhausted» без срока — повторы с паузами 2/6/18 с.
+  Словарь с диаризацией Vertex принимает, но теряет половину текста — та же схема двух проходов.
+  Ответ: часть на реплику, `audioTranscription: {text, speakerLabel, words: [{word, startOffset,
+  endOffset}]}` — `parseVertex`.
 
 ## Тесты
 
