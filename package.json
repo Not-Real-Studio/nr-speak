@@ -39,16 +39,20 @@
   },
   "dependencies": {
     "defuddle": "^0.19.4",
+    "fflate": "^0.8.3",
     "linkedom": "^0.18.13",
+    "mammoth": "^1.13.0",
     "msedge-tts": "^2.0.9",
     "remark-frontmatter": "^5.0.0",
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
+    "turndown": "^7.2.4",
     "unified": "^11.0.5"
   },
   "devDependencies": {
     "@types/mdast": "^4.0.4",
     "@types/node": "^24.19.1",
+    "@types/turndown": "^5.0.6",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
   }
