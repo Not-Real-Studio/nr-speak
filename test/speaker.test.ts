@@ -70,7 +70,8 @@ describe('speaker', () => {
     const gen = s.stream(['один', 'два', 'три'], {}, 'pcm')
     const first = await gen.next()
     expect(dec(first.value as Uint8Array)).toBe('[Kore:один]')
-    await new Promise((r) => setTimeout(r, 5))
+    // Следующий кусок — заранее (до чтения потока дальше): ждём условием, не таймером.
+    for (let i = 0; i < 100 && v.calls.length < 2; i++) await new Promise((r) => setTimeout(r, 5))
     expect(v.calls.map((c) => c.text)).toEqual(['один', 'два'])
     const rest: string[] = []
     for await (const p of gen) rest.push(dec(p))

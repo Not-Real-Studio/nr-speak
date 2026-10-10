@@ -115,7 +115,7 @@ export function cleanInline(s: string): string {
   return stripTokens(s.replace(URL_RE, ''))
     .replace(NOTE, '')
     .replace(/\s*:\s*(?=[.,;!?])/g, '')
-    .replace(/\(\s*[,;]?\s*\)|\[\s*\]/g, '')
+    .replace(/\(\s*[,;]?\s*\)|\[\s*\]|`\s*`/g, '')
     .replace(/\s+[—–]\s*(?=[,.;:!?])/g, '')
     .replace(/\s+([,.;:!?…»)])/g, '$1')
     .replace(/([«(])\s+/g, '$1')
