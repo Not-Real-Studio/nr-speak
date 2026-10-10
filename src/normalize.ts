@@ -4,8 +4,10 @@
  * `@notrealstudio/speak/node`). Markdown → mdast (remark + gfm + frontmatter), обход:
  *
  * - выкидывается: frontmatter, картинки, адреса ссылок (текст ссылки остаётся), голые
- *   URL, сноски, HTML и комментарии, хэши коммитов/конфигов (`[0-9a-f]{7,40}` с цифрой
- *   и буквой);
+ *   URL, сноски, HTML и комментарии; мусор-токены (`stripTokens`) — hex от 7 символов с
+ *   цифрой и буквой (хэши, ключи любой длины), UUID, base64-подобные строки, ключи и токены
+ *   по префиксам (`sk-`, `ghp_`, `AIza`, JWT `eyJ…`, `Bearer …`), секреты в параметрах
+ *   адреса (`?key=…`); «ключ: <токен>» → «ключ»;
  * - блок кода — фраза «Пропущен блок кода.» (`code: 'announce'`) или ничего (`skip`);
  * - инлайн-код: короткое слово/идентификатор — текстом без бэктиков; путь, флаг, длинное —
  *   по политике `inlineCode`: `read` (текстом, разделители `/ _ =` → пробел), `announce`
@@ -53,19 +55,66 @@ const BOX = /[┌┬┐├┼┤└┴┘│─╔╦╗╠╬╣╚╩╝║═
 const BOX_LINE = /^\s*[┌┬┐├┼┤└┴┘│─╔╦╗╠╬╣╚╩╝║═╭╮╯╰]/
 const BOX_RULE = /^[\s┌┬┐├┼┤└┴┘─╔╦╗╠╬╣╚╩╝═╭╮╯╰+|:-]+$/
 
-/** Хэш: 7–40 hex-символов, хотя бы одна цифра и одна буква (иначе это число или слово). */
-const HASH = /(?<![\p{L}\p{N}_])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}(?![\p{L}\p{N}_])/giu
-const HASH_WHOLE = /^(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}$/i
+/** Хэш: от 7 hex-символов, хотя бы одна цифра и одна буква (иначе это число или слово). */
+const HEX = String.raw`(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,}`
+const HASH_WHOLE = new RegExp(`^${HEX}$`, 'i')
+const B = String.raw`(?<![\p{L}\p{N}_])`
+const E = String.raw`(?![\p{L}\p{N}_])`
+/**
+ * Мусор-токены — то, что голосом читается посимвольно и смысла не несёт. Порядок важен:
+ * сначала целые конструкции (`Bearer …`, префиксные ключи, JWT), потом общие формы.
+ */
+const TOKENS: readonly RegExp[] = [
+  // `Bearer <токен>` — целиком, вместе со словом.
+  /\bBearer\s+[A-Za-z0-9._~+/=…*-]{5,}[A-Za-z0-9_=…*]/gu,
+  // Ключи по префиксам: OpenAI/Stripe `sk-`/`sk_`/`pk_`/`rk_`, GitHub `ghp_`/`gho_`/`ghs_`/`ghu_`/`github_pat_`,
+  // Slack `xoxb-`/`xoxa-`/`xoxp-`, Google `AIza…`, OAuth `ya29.…`; хвост — с маской `…`/`*`.
+  new RegExp(`${B}(?:sk|pk|rk)[-_](?:[a-z]+[-_])?[A-Za-z0-9…*][A-Za-z0-9_…*.-]{4,}[A-Za-z0-9_…*]${E}`, 'gu'),
+  new RegExp(`${B}(?:gh[pousr]_|github_pat_)[A-Za-z0-9_…*]{6,}${E}`, 'gu'),
+  new RegExp(`${B}xox[bapros]-[A-Za-z0-9…*-]{6,}${E}`, 'gu'),
+  new RegExp(`${B}AIza[0-9A-Za-z_…*-]{10,}${E}`, 'gu'),
+  new RegExp(`${B}ya29\\.[0-9A-Za-z_…*.-]{9,}[0-9A-Za-z_…*]${E}`, 'gu'),
+  // JWT: `eyJ…` (заголовок base64url), с точками частей.
+  new RegExp(`${B}eyJ[A-Za-z0-9_-]{8,}(?:\\.[A-Za-z0-9_-]*){0,2}${E}`, 'gu'),
+  // Адрес без схемы с секретом в параметре (`host/tts?key=…&text=…`) — целиком.
+  /[^\s()«»"'[\]]*[?&](?:key|api[_-]?key|token|access[_-]?token|secret|sig|signature|password|pwd|auth)=[^\s)\]»"']*[^\s)\]»"'.,;:!?]/giu,
+  // UUID.
+  new RegExp(`${B}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}${E}`, 'giu'),
+  // Сокращённый в середине hex-ключ: `84b871fc…77606`, `84b8...7760`.
+  new RegExp(`${B}[0-9a-f]{4,}(?:…|\\.{3})[0-9a-f]{3,}${E}`, 'giu'),
+  // hex от 7 символов без верхней границы (хэши коммитов, ключи API).
+  new RegExp(`${B}${HEX}${E}`, 'giu'),
+  // base64/base64url от 20 символов: оба регистра и цифра (`dGhpcyBpcyBh…`, `AbC9_xYz-…`).
+  new RegExp(`${B}(?=[A-Za-z0-9+/_-]*[A-Z])(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*\\d)[A-Za-z0-9+/_-]{20,}={0,2}(?![\\p{L}\\p{N}_=])`, 'gu'),
+  // Случайная строка в нижнем регистре от 24 символов с ≥4 цифрами и ≥4 буквами, без разделителей.
+  new RegExp(`${B}(?=(?:[a-z]*\\d){4})(?=(?:\\d*[a-z]){4})[a-z0-9]{24,}${E}`, 'gu'),
+]
+
+/**
+ * Мусор-токены → пусто; «ключ: <токен>» → «ключ» (двоеточие перед пустым местом уходит).
+ * Числа (`1234567`), слова (`deadbeef`), идентификаторы с разделителями — не трогаются.
+ */
+export function stripTokens(s: string): string {
+  let out = s
+  for (const re of TOKENS) out = out.replace(re, '\u0000')
+  if (out === s) return s
+  return out
+    .replace(/\s*[:=]\s*\u0000/gu, '')
+    .replace(/\u0000/g, ' ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\s+([,.;:!?…»)])/g, '$1')
+    .trim()
+}
+
 /** Сноски-номера и пометки вики (`[1]`, `[a]`, `[уточнить]`, `[источник не указан 123 дня]`). */
 const NOTE = /\[(?:\d{1,3}|[a-zа-я]|уточнить|источник[^\]]{0,40}|нет в источнике|нет АИ[^\]]{0,20}|неавторитетный источник\??|когда\?|кем\?|где\?|что\?|прояснить|стиль|орфография)\]/giu
 const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()\]]+[^\s<>()\].,;:!?»"']/giu
 
-/** Чистка строки для слуха: хэши, голые адреса, пустые скобки, пробелы. */
+/** Чистка строки для слуха: голые адреса, мусор-токены, сноски, пустые скобки, пробелы. */
 export function cleanInline(s: string): string {
-  return s
-    .replace(URL_RE, '')
-    .replace(HASH, '')
+  return stripTokens(s.replace(URL_RE, ''))
     .replace(NOTE, '')
+    .replace(/\s*:\s*(?=[.,;!?])/g, '')
     .replace(/\(\s*[,;]?\s*\)|\[\s*\]/g, '')
     .replace(/\s+[—–]\s*(?=[,.;:!?])/g, '')
     .replace(/\s+([,.;:!?…»)])/g, '$1')
@@ -80,7 +129,7 @@ const WORDISH = /^[\p{L}\p{N}][\p{L}\p{N}.'’+#-]*$/u
 export function inlineCode(value: string, policy: L0Opts['inlineCode'] = 'read'): string {
   const v = value.trim()
   if (!v) return ''
-  if (HASH_WHOLE.test(v)) return ''
+  if (HASH_WHOLE.test(v) || !stripTokens(v).trim()) return ''
   if (v.length <= 24 && WORDISH.test(v)) return v
   if (policy === 'skip') return ''
   if (policy === 'announce') return 'код'

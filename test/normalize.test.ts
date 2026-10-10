@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { blocksText, cleanInline, inlineCode, l0Markdown, l0Text, parseBoxTable, tableText } from '../src/index.js'
+import { blocksText, cleanInline, inlineCode, l0Markdown, l0Text, parseBoxTable, stripTokens, tableText } from '../src/index.js'
 
 const md = (s: string, o = {}): string => blocksText(l0Markdown(s, o).blocks)
 
@@ -39,6 +39,31 @@ describe('L0: markdown', () => {
       'коммит ушёл, хэш, число 1234567, слово deadbeef, тире, конец',
     )
     expect(cleanInline('Текст[1] с пометкой[уточнить] и [источник не указан 100 дней].')).toBe('Текст с пометкой и.')
+  })
+
+  it('мусор-токены (DEV-250 §2): ключи любой длины, префиксы, JWT, UUID, base64, ?key=', () => {
+    // Кейс приёмки DEV-248: ключ из 48 hex читался посимвольно.
+    const key = '84b871fc0a1e9d3c55b2e7f4a6c8d0e1f3a5b7c9d1e3f5a77606'
+    expect(cleanInline(`Новый ключ: ${key}, сохрани его.`)).toBe('Новый ключ, сохрани его.')
+    expect(cleanInline('Ключ 84b871fc…77606 в конфиге.')).toBe('Ключ в конфиге.')
+    expect(cleanInline('Открой https://speak.notreal.studio/tts?key=abc123XYZ&text=привет и speak.notreal.studio/tts?key=s3cr3t&voice=Kore — работает.')).toBe('Открой и — работает.')
+    expect(cleanInline('Токен OpenAI: sk-proj-AbCdEf1234567890xyz, GitHub ghp_16C7e42F292c6912E7710c838347Ae178B4a, Slack xoxb-123456-abcdef.')).toBe('Токен OpenAI, GitHub, Slack.')
+    expect(cleanInline('Заголовок Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abc123 и всё.')).toBe('Заголовок Authorization и всё.')
+    expect(cleanInline('JWT eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.sig_x в куке.')).toBe('JWT в куке.')
+    expect(cleanInline('Google AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY и ya29.a0AfH6SMBx1234567890.')).toBe('Google и.')
+    expect(cleanInline('UUID 123e4567-e89b-12d3-a456-426614174000 записи.')).toBe('UUID записи.')
+    expect(cleanInline('base64: dGhpcyBpcyBhIHNlY3JldCBrZXkgMTIz== конец.')).toBe('base64 конец.')
+    expect(cleanInline('Сессия ksacxf8kk2p5x7q9w3e1r5t8y2u4 — своя.')).toBe('Сессия — своя.')
+    // Не мусор: слова, числа, имена моделей, CamelCase, пакеты.
+    const keep = 'Слова остаются: deadbeef, 1234567, gemini-3.5-transcribe-preview, TranscribeAudio, nr-speak, sk-1, DEV-250.'
+    expect(cleanInline(keep)).toBe(keep)
+    expect(stripTokens('без токенов')).toBe('без токенов')
+  })
+
+  it('мусор-токены в инлайн-коде и markdown', () => {
+    expect(md('Ключ: `84b871fc0a1e9d3c55b2e7f4a6c8d0e1f3a5b7c9d1e3f5a77606`.')).toBe('Ключ.')
+    expect(md('Вызов `sk-abc123def456ghi` и [панель](https://x.io/?token=abc).')).toBe('Вызов и панель.')
+    expect(inlineCode('ghp_16C7e42F292c6912E7710c838347Ae178B4a')).toBe('')
   })
 
   it('списки → предложения; вложенные — подряд', () => {
