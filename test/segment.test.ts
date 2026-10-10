@@ -53,4 +53,14 @@ describe('сегменты', () => {
   it('простой текст — абзацы по пустой строке', () => {
     expect(segmentText('Один.\n\nДва.', { first: 3 }).map((s) => s.text)).toEqual(['Один.', 'Два.'])
   })
+
+  it('разгон: первый ~250, второй до 400, дальше — потолок (DEV-250 §6)', () => {
+    const text = Array.from({ length: 60 }, (_, i) => `Предложение номер ${i + 1} про поток звука.`).join(' ')
+    const segs = segmentText(text, { first: 250, second: 400, maxChars: 700 }).map((x) => x.text.length)
+    expect(segs[0]).toBeLessThanOrEqual(260)
+    expect(segs[1]).toBeLessThanOrEqual(400)
+    expect(segs[1]).toBeGreaterThan(300)
+    expect(Math.max(...segs.slice(2))).toBeLessThanOrEqual(700)
+    expect(segs[2]).toBeGreaterThan(600)
+  })
 })

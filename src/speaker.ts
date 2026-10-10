@@ -2,14 +2,18 @@
  * Speaker — сборка «голос → движок → звук → формат → кэш» поверх настроенных движков.
  * Один кусок (`synth`) — один запрос к движку; повтор того же куска — из кэша, без
  * синтеза. Ключ — `sha256(engine|voice|instruct|speed|text)`, файл — `<ключ>.<формат>`.
- * Длинный текст — последовательность кусков (`stream`): следующий синтезируется, пока
- * отдаётся текущий. Кэш и ffmpeg — инъекцией (`@notrealstudio/speak/node`).
+ * Длинный текст — последовательность кусков (`stream`): кусок не из кэша отдаётся по мере
+ * синтеза — кадры движка (PCM Gemini) идут в ffmpeg-трубу и наружу сразу (первый звук до
+ * конца синтеза), параллельно копятся и по завершении ложатся в кэш. Кэш и ffmpeg —
+ * инъекцией (`@notrealstudio/speak/node`).
  */
 
 import type { CatalogVoice, EngineName, Engines, Resolved } from './catalog.js'
 import { catalog, resolveVoice } from './catalog.js'
-import type { FfmpegRun, Format } from './audio.js'
-import { collect, concat, CONTENT_TYPE, convert, OUT_RATE, wavHeader } from './audio.js'
+import type { FfmpegPipe, FfmpegRun, Format } from './audio.js'
+import { collect, concat, CONTENT_TYPE, convert, ffmpegArgs, OUT_RATE, wavHeader } from './audio.js'
+import type { AudioChunk } from './types.js'
+import { isMp3, isPcm, rateOf } from './types.js'
 
 export interface SegmentCache {
   get(key: string): Promise<Uint8Array | undefined>
@@ -42,6 +46,8 @@ export interface SpeakerOpts {
   favorites?: readonly string[] | undefined
   cache?: SegmentCache | undefined
   ffmpeg?: FfmpegRun | undefined
+  /** ffmpeg трубой — поток куска по мере синтеза; нет — кусок отдаётся целиком после синтеза. */
+  ffmpegPipe?: FfmpegPipe | undefined
 }
 
 export interface Speaker {
@@ -54,7 +60,10 @@ export interface Speaker {
   /** Ключ кэша куска (без синтеза). */
   key(text: string, req: SpeakRequest, format: Format): Promise<{ key: string; voice: Resolved }>
   synth(text: string, req: SpeakRequest, format: Format, signal?: AbortSignal): Promise<SynthResult>
-  /** Куски подряд одним потоком (mp3/opus — склейкой, wav — один заголовок + PCM). */
+  /**
+   * Куски подряд одним потоком (mp3/opus — склейкой, wav — один заголовок + PCM). Кусок не из
+   * кэша — по мере синтеза (`ffmpegPipe`), ошибка до первого байта — исключением из первого `next()`.
+   */
   stream(texts: readonly string[], req: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array>
 }
 
@@ -126,20 +135,141 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     return { data, contentType, cached: false, key: k, voice }
   }
 
+  /** Кусок потоком: кэш/идущий синтез — целиком; иначе кадры движка → (ffmpeg-труба) → наружу и в кэш. */
+  async function* live(text: string, req: SpeakRequest, format: Format, signal?: AbortSignal, onFirst: () => void = () => {}): AsyncGenerator<Uint8Array> {
+    if (!text.trim()) throw new Error('speak: пустой текст')
+    const { key: k, voice } = await key(text, req, format)
+    const running = inflight.get(k)
+    if (running) {
+      const r = await running
+      onFirst()
+      return yield r.data
+    }
+    const hit = await o.cache?.get(k)
+    if (hit) {
+      stats.hits++
+      onFirst()
+      return yield hit
+    }
+    const engine = o.engines[voice.engine]!
+    const speed = speedOf(req)
+    const tempo = engine.nativeSpeed ? 1 : speed
+    stats.synth++
+    const it = engine
+      .speak(
+        text,
+        voice.voice,
+        {
+          ...(req.instruct?.trim() ? { instruct: req.instruct.trim() } : {}),
+          ...(engine.nativeSpeed && speed !== 1 ? { speed } : {}),
+          format: format === 'mp3' ? 'mp3' : 'pcm',
+        },
+        signal,
+      )
+      [Symbol.asyncIterator]()
+    // Первый кадр — до первого байта наружу: ошибка провайдера/резолва уходит исключением.
+    const first = await it.next()
+    if (first.done) throw new Error('speak: провайдер не прислал звука')
+    onFirst()
+    const mime = first.value.mime
+    const parts: Uint8Array[] = []
+    let settle: (r: SynthResult | PromiseLike<SynthResult>) => void = () => {}
+    let fail: (e: unknown) => void = () => {}
+    const done = new Promise<SynthResult>((res, rej) => ((settle = res), (fail = rej)))
+    done.catch(() => {})
+    inflight.set(k, done)
+    let complete = false
+    try {
+      const direct = tempo === 1 && ((format === 'mp3' && isMp3(mime)) || (format === 'pcm' && isPcm(mime) && rateOf(mime) === OUT_RATE))
+      if (direct) {
+        for (let n: IteratorResult<AudioChunk> = first; !n.done; n = await it.next()) {
+          parts.push(n.value.data)
+          yield n.value.data
+        }
+      } else if (o.ffmpegPipe && format !== 'wav') {
+        const proc = o.ffmpegPipe(ffmpegArgs(mime, format, tempo, true))
+        let feedErr: unknown
+        let stopped = false
+        const feeding = (async () => {
+          try {
+            for (let n: IteratorResult<AudioChunk> = first; !n.done && !stopped; n = await it.next()) await proc.write(n.value.data)
+            proc.end()
+          } catch (err) {
+            feedErr = err
+            proc.kill()
+          }
+        })()
+        let drained = false
+        try {
+          for await (const b of proc.output) {
+            parts.push(b)
+            yield b
+          }
+          drained = true
+        } finally {
+          // Ушли раньше конца (клиент закрыл поток, ошибка) — ffmpeg и подачу оборвать.
+          if (!drained) {
+            stopped = true
+            proc.kill()
+          }
+        }
+        await feeding
+        if (feedErr !== undefined) throw feedErr
+      } else {
+        // Без трубы — как раньше: собрать, перекодировать, отдать целиком.
+        const rest: AudioChunk[] = [first.value]
+        for (let n = await it.next(); !n.done; n = await it.next()) rest.push(n.value)
+        const data = await convert({ data: concat(rest.map((c) => c.data)), mime }, format, { speed: tempo, ffmpeg: o.ffmpeg })
+        parts.push(data)
+        yield data
+      }
+      if (signal?.aborted) throw new Error('speak: синтез отменён')
+      const data = concat(parts)
+      complete = true
+      await o.cache?.set(k, data)
+      settle({ data, contentType: CONTENT_TYPE[format], cached: false, key: k, voice })
+    } catch (err) {
+      fail(err)
+      throw err
+    } finally {
+      // Клиент ушёл посреди куска — движок не дослушиваем, в кэш не пишем.
+      if (!complete) {
+        fail(new Error('speak: поток куска оборван'))
+        await it.return?.(undefined)?.catch?.(() => {})
+      }
+      if (inflight.get(k) === done) inflight.delete(k)
+    }
+  }
+
   async function* stream(texts: readonly string[], req: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
     if (!texts.length) throw new Error('speak: пустой текст')
     // wav: один заголовок на поток, куски — сырым PCM.
     const part: Format = format === 'wav' ? 'pcm' : format
-    if (format === 'wav') yield wavHeader(OUT_RATE)
-    let next: Promise<SynthResult> | null = synth(texts[0]!, req, part, signal)
+    let started = false
+    let ahead: Promise<SynthResult> | undefined
     for (let i = 0; i < texts.length; i++) {
-      const cur: Promise<SynthResult> = next!
-      next = i + 1 < texts.length ? cur.then(() => synth(texts[i + 1]!, req, part, signal)) : null
-      // Ошибку следующего куска увидит его очередь, не необработанный reject.
-      next?.catch(() => {})
-      const r = await cur
+      // Следующий кусок — заранее, как только у текущего пошёл звук (не в споре за первый байт).
+      let next: Promise<SynthResult> | undefined
+      const prefetch = (): void => {
+        const t = texts[i + 1]
+        if (t === undefined || signal?.aborted || next) return
+        next = synth(t, req, part, signal)
+        next.catch(() => {})
+      }
+      const parts: AsyncIterable<Uint8Array> = ahead
+        ? (async function* (p: Promise<SynthResult>) {
+            const r = await p
+            prefetch()
+            yield r.data
+          })(ahead)
+        : live(texts[i]!, req, part, signal, prefetch)
+      for await (const b of parts) {
+        if (!started && format === 'wav') yield wavHeader(OUT_RATE)
+        started = true
+        yield b
+      }
       if (signal?.aborted) return
-      yield r.data
+      ahead = next
     }
   }
 

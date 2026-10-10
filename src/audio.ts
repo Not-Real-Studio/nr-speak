@@ -19,6 +19,18 @@ export const OUT_RATE = 24000
 /** Запуск ffmpeg: аргументы, байты на stdin → байты stdout. */
 export type FfmpegRun = (args: string[], input: Uint8Array) => Promise<Uint8Array>
 
+/**
+ * ffmpeg трубой: байты пишутся по мере прихода, выход читается по мере кодирования
+ * (поток первого звука). `output` бросает, если ffmpeg вышел с ошибкой; `kill` — оборвать.
+ */
+export interface FfmpegProc {
+  write(data: Uint8Array): Promise<void>
+  end(): void
+  output: AsyncIterable<Uint8Array>
+  kill(): void
+}
+export type FfmpegPipe = (args: string[]) => FfmpegProc
+
 export function concat(parts: readonly Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
   let at = 0
@@ -100,8 +112,8 @@ export function atempo(speed: number): string {
   return parts.map((p) => `atempo=${p}`).join(',')
 }
 
-/** Аргументы ffmpeg: вход по mime, темп, выход по формату (wav — как pcm, заголовок ставит JS). */
-export function ffmpegArgs(mime: string, to: Format, speed = 1): string[] {
+/** Аргументы ffmpeg: вход по mime, темп, выход по формату (wav — как pcm, заголовок ставит JS); `live` — для трубы. */
+export function ffmpegArgs(mime: string, to: Format, speed = 1, live = false): string[] {
   const input = isMp3(mime) ? ['-f', 'mp3'] : isWav(mime) ? ['-f', 'wav'] : ['-f', 's16le', '-ar', String(rateOf(mime)), '-ac', '1']
   const filter = speed !== 1 ? ['-filter:a', atempo(speed)] : []
   const output =
@@ -110,7 +122,9 @@ export function ffmpegArgs(mime: string, to: Format, speed = 1): string[] {
       : to === 'opus'
         ? ['-c:a', 'libopus', '-b:a', '32k', '-ac', '1', '-f', 'ogg']
         : ['-f', 's16le', '-ar', String(OUT_RATE), '-ac', '1']
-  return ['-hide_banner', '-loglevel', 'error', ...input, '-i', 'pipe:0', ...filter, ...output, 'pipe:1']
+  // live — труба: кадры наружу сразу, без буфера муксера (первый звук раньше).
+  const flush = live ? ['-flush_packets', '1'] : []
+  return ['-hide_banner', '-loglevel', 'error', ...input, '-i', 'pipe:0', ...filter, ...output, ...flush, 'pipe:1']
 }
 
 /**

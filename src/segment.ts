@@ -26,6 +26,11 @@ export interface SegmentOpts {
   maxBytes?: number | undefined
   /** Цель первого куска, символов (по умолчанию 250): одно-два предложения. */
   first?: number | undefined
+  /**
+   * Потолок второго куска (разгон 250 → 400 → потолок): пока звучит первый, второй успевает
+   * синтезироваться. Нет — второй кусок обычного размера.
+   */
+  second?: number | undefined
 }
 
 const enc = new TextEncoder()
@@ -82,7 +87,8 @@ export function segment(blocks: readonly Block[], o: SegmentOpts = {}): Segment[
   const firstTarget = o.first ?? 250
   const out: Segment[] = []
   let cur = ''
-  const limit = (): number => (out.length === 0 ? Math.min(firstTarget, maxChars) : maxChars)
+  const second = o.second ? Math.min(o.second, maxChars) : maxChars
+  const limit = (): number => (out.length === 0 ? Math.min(firstTarget, maxChars) : out.length === 1 ? second : maxChars)
   const fits = (s: string): boolean => s.length <= maxChars && bytes(s) <= maxBytes
   const flush = (): void => {
     if (cur.trim()) out.push({ text: cur.trim(), kind: 'text' })

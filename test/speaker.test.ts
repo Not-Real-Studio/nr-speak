@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createSpeaker, parseWav, streamAll } from '../src/index.js'
-import type { SegmentCache } from '../src/index.js'
+import type { AudioChunk, FfmpegPipe, SegmentCache, TtsEngine } from '../src/index.js'
 import { mockEngine } from './helpers.js'
 
 function memCache(): SegmentCache & { map: Map<string, Uint8Array> } {
@@ -77,5 +77,125 @@ describe('speaker', () => {
     expect(rest).toEqual(['[Kore:два]', '[Kore:три]'])
     const wav = await streamAll(s.stream(['а', 'б'], {}, 'wav'))
     expect(dec(parseWav(wav).pcm)).toBe('[Kore:а][Kore:б]')
+  })
+
+  it('поток куска (DEV-250 §6): кадры движка → ffmpeg-труба → наружу до конца синтеза; кэш — по завершении', async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => (release = r))
+    const calls: string[] = []
+    const engine: TtsEngine = {
+      kind: 'vertex',
+      async voices() {
+        return []
+      },
+      async design() {
+        throw new Error('нет')
+      },
+      async *speak(text): AsyncGenerator<AudioChunk> {
+        calls.push(text)
+        const mime = 'audio/l16; rate=24000; channels=1'
+        yield { data: new TextEncoder().encode(`<${text}:1>`), mime }
+        await gate
+        yield { data: new TextEncoder().encode(`<${text}:2>`), mime }
+      },
+    }
+    const pipes: string[][] = []
+    // Труба-мок: «кодирует» каждый кадр сразу (верхний регистр), выход — по мере записи.
+    const ffmpegPipe: FfmpegPipe = (args) => {
+      pipes.push(args)
+      const queue: Uint8Array[] = []
+      let wake: () => void = () => {}
+      let ended = false
+      return {
+        async write(d) {
+          queue.push(new TextEncoder().encode(dec(d).toUpperCase()))
+          wake()
+        },
+        end() {
+          ended = true
+          wake()
+        },
+        kill() {
+          ended = true
+          wake()
+        },
+        output: (async function* () {
+          for (;;) {
+            if (queue.length) yield queue.shift()!
+            else if (ended) return
+            else await new Promise<void>((r) => (wake = r))
+          }
+        })(),
+      }
+    }
+    const cache = memCache()
+    const s = createSpeaker({ engines: { vertex: engine }, defaultVoice: 'vertex:Kore', cache, ffmpegPipe })
+    const gen = s.stream(['один'], {}, 'mp3')
+    const a = await gen.next()
+    // Первый кадр уже снаружи, а движок ещё не закончил — кэш пуст.
+    expect(dec(a.value as Uint8Array)).toBe('<ОДИН:1>')
+    expect(cache.map.size).toBe(0)
+    expect(pipes[0]).toContain('-flush_packets')
+    release()
+    const rest: string[] = []
+    for await (const p of gen) rest.push(dec(p))
+    expect(rest).toEqual(['<ОДИН:2>'])
+    expect([...cache.map.values()].map(dec)).toEqual(['<ОДИН:1><ОДИН:2>'])
+    // Повтор — из кэша, без движка.
+    expect(dec(await streamAll(s.stream(['один'], {}, 'mp3')))).toBe('<ОДИН:1><ОДИН:2>')
+    expect(calls).toEqual(['один'])
+  })
+
+  it('поток куска: клиент ушёл посреди — ffmpeg оборван, в кэш не пишется; ошибка движка — до первого байта', async () => {
+    const v = mockEngine({ kind: 'vertex', fail: Object.assign(new Error('лимит'), { status: 429 }) })
+    const s = createSpeaker({ engines: { vertex: v.engine }, defaultVoice: 'vertex:Kore', cache: memCache() })
+    await expect(s.stream(['x'], {}, 'mp3').next()).rejects.toThrow('лимит')
+    let killed = false
+    const engine: TtsEngine = {
+      kind: 'vertex',
+      async voices() {
+        return []
+      },
+      async design() {
+        throw new Error('нет')
+      },
+      async *speak(): AsyncGenerator<AudioChunk> {
+        for (let i = 0; i < 100; i++) yield { data: new Uint8Array([i]), mime: 'audio/l16; rate=24000; channels=1' }
+      },
+    }
+    const ffmpegPipe: FfmpegPipe = () => {
+      const q: Uint8Array[] = []
+      return {
+        async write(d) {
+          q.push(d)
+        },
+        end() {},
+        kill() {
+          killed = true
+        },
+        output: (async function* () {
+          for (;;) {
+            if (killed) return
+            if (q.length) yield q.shift()!
+            else await new Promise((r) => setTimeout(r, 1))
+          }
+        })(),
+      }
+    }
+    const cache = memCache()
+    const s2 = createSpeaker({ engines: { vertex: engine }, defaultVoice: 'vertex:Kore', cache, ffmpegPipe })
+    const gen = s2.stream(['y'], {}, 'mp3')
+    await gen.next()
+    await gen.return(undefined)
+    expect(killed).toBe(true)
+    expect(cache.map.size).toBe(0)
+  })
+
+  it('поток куска: mp3 движка (Edge) — без ffmpeg, кадры как есть', async () => {
+    const edge = mockEngine({ kind: 'edge', voices: ['ru-RU-SvetlanaNeural'], nativeSpeed: true, mime: 'audio/mpeg' })
+    const s = createSpeaker({ engines: { edge: edge.engine }, ffmpegPipe: () => {
+      throw new Error('ffmpeg не нужен')
+    } })
+    expect(dec(await streamAll(s.stream(['x'], { voice: 'Svetlana' }, 'mp3')))).toBe('[ru-RU-SvetlanaNeural:x]')
   })
 })
