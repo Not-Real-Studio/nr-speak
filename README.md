@@ -6,8 +6,9 @@
 OpenAI-совместимый `/v1/audio/speech` (локальный mlx-audio и подобные). Сверху — единый
 каталог голосов с полными именами (`vertex:Kore`, `edge:ru-RU-SvetlanaNeural`) и резолвом
 коротких, нормализатор L0 (markdown/html/текст → текст для слуха: без кода, ссылок, хэшей,
-таблицы построчно), нарезка на куски под лимиты движков, синтез куска с кэшем по хэшу и
-перекодирование в mp3/wav/opus/pcm через ffmpeg. Ядро без Node (HTTP — инъекцией `fetch`);
+ключей и токенов, таблицы построчно), книги → markdown (fb2, epub, pdf, docx), нарезка на куски
+под лимиты движков, синтез куска с кэшем по хэшу — потоком, по мере синтеза (первый звук до
+конца куска) — и перекодирование в mp3/wav/opus/pcm через ffmpeg. Ядро без Node (HTTP — инъекцией `fetch`);
 Node-половина (`/node`) — конфиг из цепочки runz, токен gcloud, кэш на диске, ffmpeg,
 html → markdown через Defuddle.
 
@@ -15,10 +16,11 @@ html → markdown через Defuddle.
 
 ```ts
 import { createSpeaker, l0Markdown, segment } from '@notrealstudio/speak'
-import { diskCache, enginesFromCtx, fileCache, ffmpegRunner } from '@notrealstudio/speak/node'
+import { bookToMarkdown, diskCache, enginesFromCtx, fileCache, ffmpegPipe, ffmpegRunner } from '@notrealstudio/speak/node'
 
 const engines = enginesFromCtx(ctx, { cache: fileCache('voices.json', '.') }) // ctx — IContext runz
-const speaker = createSpeaker({ engines, defaultVoice: 'vertex:Sulafat', favorites: ['Sulafat', 'Leda', 'Enceladus'], cache: diskCache('speak-cache'), ffmpeg: ffmpegRunner() })
+const speaker = createSpeaker({ engines, defaultVoice: 'vertex:Sulafat', favorites: ['Sulafat', 'Leda', 'Enceladus'], cache: diskCache('speak-cache'), ffmpeg: ffmpegRunner(), ffmpegPipe: ffmpegPipe() })
+const { markdown, title } = await bookToMarkdown(bytes, 'book.fb2')   // fb2 / fb2.zip / epub / pdf / docx
 
 const { blocks } = l0Markdown(markdown)                        // нормализатор L0
 const texts = segment(blocks).map((s) => s.text)               // куски 1–1.5K символов, первый короткий
@@ -53,7 +55,11 @@ const one = await speaker.synth('Привет', { voice: 'chirp:Aoede', speed: 1
 
 **Нормализатор L0.** `l0Markdown(md, opts)` / `l0Text(text, opts)` → `{title, blocks: [{kind, text}]}`;
 `blocksText(blocks)` — текст для глаз (`--print`). Выкидывает frontmatter, картинки, адреса
-ссылок, голые URL, сноски, HTML, хэши (`[0-9a-f]{7,40}` с цифрой и буквой); блок кода —
+ссылок, голые URL, сноски, HTML и мусор-токены (`stripTokens`, всегда): hex от 7 символов с
+цифрой и буквой без верхней границы, сокращённые ключи `84b8…7760`, UUID, base64/base64url от 20
+символов (оба регистра и цифра), ключи по префиксам `sk-`/`pk_`/`rk_`, `ghp_`/`gho_`/`github_pat_`,
+`xoxb-`, `AIza…`, `ya29.`, JWT `eyJ…`, `Bearer <токен>`, адрес без схемы с `?key=`/`token=` —
+целиком; «ключ: <токен>» → «ключ»; блок кода —
 «Пропущен блок кода.» (`code: 'skip'` — ничего); инлайн-код — слово текстом, путь/флаг по
 `inlineCode: read|announce|skip`; таблицы gfm и box-drawing — до 4×8 построчно
 «строка: колонка — значение; …», больше — «Таблица, N строк, колонки: …»
@@ -61,15 +67,20 @@ const one = await speaker.synth('Привет', { voice: 'chirp:Aoede', speed: 1
 Node: `normalize(src, 'text'|'markdown'|'html', opts)`, `htmlToMarkdown(html, url)` (Defuddle +
 linkedom), `formatOf(name)`.
 
-**Куски.** `segment(blocks, {maxChars=1500, maxBytes=3600, first=250})` → `[{text, kind}]`:
+**Куски.** `segment(blocks, {maxChars=1500, maxBytes=3600, first=250, second?})` → `[{text, kind}]`
+(`second` — разгон 250 → 400 → потолок):
 заголовок — отдельный кусок, первый — короткий, режет по абзацам → предложениям → запятым →
 пробелам. `segmentText(text)` — для простого текста.
 
 **Звук.** `createSpeaker({engines, defaultVoice, cache?, ffmpeg?})`: `synth(text, req, format)`
 — один кусок, ключ кэша `sha256(engine|voice|instruct|speed|text).<формат>`, повтор — без
-синтеза (`stats: {synth, hits}`); `stream(texts, req, format)` — куски подряд, следующий
-синтезируется, пока отдаётся текущий (wav — один стримовый заголовок, `finalizeWav` чинит
-размеры для файла). `convert(audio, format, {speed, ffmpeg})`: mp3 → mp3 и PCM ↔ wav/pcm без
+синтеза (`stats: {synth, hits}`); `stream(texts, req, format)` — куски подряд: кусок не из кэша
+идёт **потоком** — кадры движка (PCM Gemini) → `ffmpegPipe` (`-flush_packets 1`) → наружу сразу,
+копия ложится в кэш по завершении (клиент ушёл посреди — ffmpeg и движок обрываются, кэш не
+пишется); mp3 движка (Edge) — без ffmpeg; без `ffmpegPipe` — кусок целиком, как раньше;
+следующий кусок синтезируется заранее, с первого звука текущего; ошибка до первого байта —
+исключением из первого `next()` (wav — один стримовый заголовок, `finalizeWav` чинит размеры
+для файла). `convert(audio, format, {speed, ffmpeg})`: mp3 → mp3 и PCM ↔ wav/pcm без
 ffmpeg, остальное — ffmpeg (`ffmpegArgs`, темп — `atempo`).
 
 **Node.** `enginesFromCtx(ctx, {cache})` — движки из `~/.runz/config.md`: `vertex` и `chirp` —
@@ -78,7 +89,26 @@ ffmpeg, остальное — ffmpeg (`ffmpegArgs`, темп — `atempo`).
 `$openai_provider` блока `## $speak` → `## $provider <имя>` (`$base_url`, `$model`, `$api_key`),
 `$engines` — явный список. `engineFromCtx`/`providerOf`/`gcloudToken`/`fileCache` — прежний
 выбор одного движка сервиса voice nrchat (`$voice_provider`). `diskCache(dir)`,
-`ffmpegRunner(bin?)`.
+`ffmpegRunner(bin?)`, `ffmpegPipe(bin?)` (труба для потока).
+
+**Книги (Node).** `sniffBook(bytes, name?)` — формат по сигнатуре (`%PDF`; zip: epub —
+`META-INF/container.xml`, docx — `word/document.xml`, fb2.zip — `*.fb2`; `<FictionBook`), затем
+`bookToMarkdown(bytes, name?, {notes?, pdftotext?}) → {format, title, author?, markdown}` (до 50 МБ,
+`BOOK_MAX_BYTES`); книга — `#`, главы — `##`… по вложенности; `tidyBook` снимает обвязку Project
+Gutenberg, разделы «Примечания», оглавления ссылками на файлы и склеивает «Глава I» + название.
+- `fb2ToMarkdown` — свой разбор (linkedom, XML): кодировка из декларации (utf-8, windows-1251),
+  `section/title` по вложенности, `p`, `emphasis`/`strong`, `poem/stanza/v` — строками, `epigraph`/
+  `cite` — цитатой, `subtitle`, таблицы; `binary` и сноски — прочь (`notes: true` — в конец);
+  главы абзацем (`<p><strong>Глава II</strong></p>`) — заголовками.
+- `epubToMarkdown` — fflate + OPF: метаданные, spine (без `linear="no"`, без служебных
+  `title/about/cover/pg-header…`), заголовок главы из nav/NCX, если в тексте его нет;
+  xhtml → markdown — `htmlToMd` (turndown; самозакрытые теги XHTML раскрываются, сноски `<sup>` —
+  прочь, заголовки `role="heading"` Wikisource).
+- `docxToMarkdown` — mammoth → html → turndown; без стилей — короткий жирный абзац = заголовок.
+- `pdfToMarkdown` — `pdftotext -layout` (poppler) → `pdfLayoutToMarkdown` (чистая): колонтитулы
+  (повтор строк сверху/снизу на ≥30 % страниц) и номера страниц — прочь, абзац — по отступу и
+  пустой строке, переносы (`‐`, мягкий, `-` перед строчной) — склеить, в т.ч. через страницу;
+  меньше 20 букв на страницу — `NO_TEXT_LAYER` («нет текстового слоя (скан), OCR не поддерживается»).
 
 ## Распознавание
 
@@ -143,6 +173,14 @@ Listener над любым `SttEngine`. `retries: 0` — 429 сразу ошиб
   Словарь с диаризацией Vertex принимает, но теряет половину текста — та же схема двух проходов.
   Ответ: часть на реплику, `audioTranscription: {text, speakerLabel, words: [{word, startOffset,
   endOffset}]}` — `parseVertex`.
+
+- Книги: epub по spec не обязан иметь заголовки в тексте глав — они берутся из nav/NCX; у
+  linkedom в режиме `text/xml` `getElementsByTagName('*')` пуст — только `querySelectorAll`;
+  самозакрытые `<div/>` XHTML в `text/html` ломают дерево — раскрываются до разбора. pdf без
+  poppler — ошибка запуска с подсказкой `brew install poppler`; `pdfjs` не взят (35 МБ, теряет
+  мягкие переносы и порядок колонтитулов).
+- Поток: `-flush_packets 1` обязателен — без него муксер mp3 держит кадры, и первый байт
+  приходит почти с концом куска.
 
 ## Тесты
 
