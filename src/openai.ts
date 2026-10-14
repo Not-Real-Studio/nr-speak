@@ -56,9 +56,40 @@ export function createOpenAIEngine(o: OpenAIOpts): TtsEngine {
         const t = await res.text().catch(() => '')
         throw statusError(`openai.speak: HTTP ${res.status}${t ? ` — ${t.slice(0, 200)}` : ''}`, res.status)
       }
-      const data = new Uint8Array(await res.arrayBuffer())
-      if (!data.length) throw new Error('openai.speak: пустой ответ')
-      yield { data, mime: mp3 ? 'audio/mpeg' : 'audio/l16; rate=24000; channels=1' }
+      // Звук — по мере прихода (llm-gate стримит синтез): первый кусок не ждёт конца фразы.
+      // PCM 16 бит — куски по чётной границе, нечётный байт ждёт следующего.
+      const mime = mp3 ? 'audio/mpeg' : 'audio/l16; rate=24000; channels=1'
+      let total = 0
+      let carry: Uint8Array | null = null
+      const reader = res.body?.getReader()
+      if (!reader) {
+        const data = new Uint8Array(await res.arrayBuffer())
+        if (!data.length) throw new Error('openai.speak: пустой ответ')
+        yield { data, mime }
+        return
+      }
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value?.length) continue
+        let data: Uint8Array = carry ? concat(carry, value) : value
+        carry = null
+        if (!mp3 && data.length % 2) {
+          carry = data.subarray(data.length - 1)
+          data = data.subarray(0, data.length - 1)
+        }
+        if (!data.length) continue
+        total += data.length
+        yield { data, mime }
+      }
+      if (!total) throw new Error('openai.speak: пустой ответ')
     },
   }
+}
+
+function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length)
+  out.set(a)
+  out.set(b, a.length)
+  return out
 }

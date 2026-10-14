@@ -143,6 +143,18 @@ describe('openai', () => {
     expect(openaiRoot('http://h/v1')).toBe('http://h/v1')
   })
 
+  it('звук потоком (llm-gate): куски по мере прихода, PCM — по чётной границе', async () => {
+    const parts = [[1, 2, 3], [4, 5], [6]]
+    const body = () => new ReadableStream<Uint8Array>({ start(c) { for (const p of parts) c.enqueue(new Uint8Array(p)); c.close() } })
+    const engine = createOpenAIEngine({ baseUrl: 'http://h', model: 'm', fetch: (async () => new Response(body())) as typeof fetch })
+    const pcm = await all(engine.speak('x', 'v', {}))
+    expect(pcm.map((c) => [...c.data])).toEqual([[1, 2], [3, 4], [5, 6]])
+    const mp3 = await all(engine.speak('x', 'v', { format: 'mp3' }))
+    expect(mp3.map((c) => [...c.data])).toEqual(parts)
+    const empty = createOpenAIEngine({ baseUrl: 'http://h', model: 'm', fetch: (async () => new Response(new Uint8Array())) as typeof fetch })
+    await expect(all(empty.speak('x', 'v', {}))).rejects.toThrow(/пустой ответ/)
+  })
+
   it('ошибка — статус и тело; без голоса — ошибка до запроса', async () => {
     const engine = createOpenAIEngine({ baseUrl: 'http://h', model: 'm', fetch: (async () => new Response('nope', { status: 500 })) as typeof fetch })
     await expect(all(engine.speak('x', 'v', {}))).rejects.toThrow(/HTTP 500 — nope/)

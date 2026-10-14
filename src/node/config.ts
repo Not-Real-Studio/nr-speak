@@ -173,7 +173,7 @@ export interface EnginesFromCtxOpts {
  * Все движки speak по конфигу: `vertex` (`## $provider vertex` с `$project`), `studio`
  * (`## $provider google` с ключом — свои голоса и аудиокниги, только явно), `chirp` (тот же
  * проект и токен, что у Vertex), `edge` (без настройки), `openai` (`$openai_provider` блока
- * `## $speak` → `## $provider <имя>`: `$base_url`, `$api_key`, `$model`). `$engines` блока —
+ * `## $speak` → `## $provider <имя>`: `$base_url`, `$api_key`, `$model` или `$openai_model` блока). `$engines` блока —
  * явный список включённых.
  */
 export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
@@ -197,8 +197,9 @@ export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
   const oname = str(speakOpt(ctx, 'openai_provider'))
   if (on('openai') && oname) {
     const p = providerOf(ctx, oname)
-    const model = str(ctxGet(ctx, ['provider', oname, 'model']))
-    if (!p.baseUrl || !model) throw new Error(`speak: у провайдера ${oname} нужны $base_url и $model (## $provider ${oname} ~/.runz/config.md)`)
+    // `$openai_model` блока `## $speak` — алиас речи у провайдера без своего `$model` (llm-gate).
+    const model = str(speakOpt(ctx, 'openai_model')) ?? str(ctxGet(ctx, ['provider', oname, 'model']))
+    if (!p.baseUrl || !model) throw new Error(`speak: у провайдера ${oname} нужны $base_url и $model (или $openai_model в ## $speak) (## $provider ${oname} ~/.runz/config.md)`)
     const voices = listOf(speakOpt(ctx, 'openai_voices'))
     out.openai = createOpenAIEngine({ baseUrl: p.baseUrl, model, ...(p.apiKey ? { apiKey: p.apiKey } : {}), ...(voices ? { voices, defaultVoice: voices[0] } : {}), ...common })
   }

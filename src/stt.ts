@@ -461,3 +461,71 @@ export function sniffAudio(b: Uint8Array): string | undefined {
   }
   return undefined
 }
+
+// --- OpenAI-совместимый /v1/audio/transcriptions (llm-gate, gate-media-spec §7) ---
+
+export interface OpenAITranscriberOpts {
+  /** Корень API с `/v1` или без (`https://llm.notreal.studio`). */
+  baseUrl: string
+  apiKey?: string | undefined
+  /** Модель (алиас гейта `$output: transcribe`). */
+  model: string
+  fetch?: typeof fetch | undefined
+}
+
+const AUDIO_EXT: Record<string, string> = { 'audio/wav': 'wav', 'audio/mp3': 'mp3', 'audio/mpeg': 'mp3', 'audio/ogg': 'ogg', 'audio/flac': 'flac', 'audio/webm': 'webm', 'audio/m4a': 'm4a', 'audio/aac': 'aac', 'audio/aiff': 'aiff' }
+
+interface VerboseJson {
+  text?: string
+  language?: string
+  words?: Array<{ word?: string; text?: string; start?: number; end?: number; speaker?: string }>
+  segments?: Array<{ start?: number; end?: number; text?: string; speaker?: string }>
+}
+
+/** Языки verbose_json OpenAI — словами (`russian`); назад в код — для известных. */
+const LANG_CODES: Record<string, string> = { russian: 'ru', english: 'en', ukrainian: 'uk', german: 'de', french: 'fr', spanish: 'es' }
+
+/**
+ * Распознавание через OpenAI-совместимый сервер (гейт, speak): multipart `file`, `model`,
+ * `language`, `prompt` (словарь — через запятую), `response_format: verbose_json` +
+ * `timestamp_granularities[]=word`, `diarize` (расширение speak/гейта). Слова — `TranscriptWord[]`.
+ * Повторов 429 нет — их делает сервер (у гейта — фолбэк алиаса).
+ */
+export function createOpenAITranscriber(o: OpenAITranscriberOpts): SttEngine {
+  const url = `${o.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/audio/transcriptions`
+  const http = o.fetch ?? fetch
+  return {
+    kind: 'openai',
+    model: o.model,
+    async transcribe(audio, opts = {}) {
+      if ('uri' in audio) throw statusError('listen: OpenAI-совместимый сервер не берёт файлы Files API — только байты', 413)
+      const timed = !!(opts.segments || opts.diarize)
+      const vocab = mergeVocabulary(opts.vocabulary)
+      const form = new FormData()
+      form.append('file', new Blob([audio.data as BlobPart], { type: audio.mime }), `audio.${AUDIO_EXT[audio.mime] ?? 'bin'}`)
+      form.append('model', o.model)
+      form.append('response_format', 'verbose_json')
+      if (timed) form.append('timestamp_granularities[]', 'word')
+      if (opts.language) form.append('language', opts.language)
+      if (vocab.length) form.append('prompt', vocab.join(', '))
+      if (opts.diarize) form.append('diarize', 'true')
+      const res = await http(url, { method: 'POST', headers: o.apiKey ? { authorization: `Bearer ${o.apiKey}` } : {}, body: form, ...(opts.signal ? { signal: opts.signal } : {}) })
+      if (!res.ok) throw await errorOf(res, o.model)
+      const data = (await res.json()) as VerboseJson
+      const text = (data.text ?? '').trim()
+      const words: TranscriptWord[] = (data.words ?? []).map((w) => ({ text: String(w.word ?? w.text ?? ''), start: Number(w.start ?? 0), end: Number(w.end ?? 0), ...(w.speaker ? { speaker: w.speaker } : {}) }))
+      const segments: TranscriptSegment[] | undefined = data.segments?.length
+        ? data.segments.map((s) => ({ start: Number(s.start ?? 0), end: Number(s.end ?? 0), text: String(s.text ?? '').trim(), ...(s.speaker ? { speaker: s.speaker } : {}) }))
+        : undefined
+      const lang = data.language ? (LANG_CODES[data.language.toLowerCase()] ?? data.language) : undefined
+      const language = opts.language || lang || guessLanguage(text)
+      return {
+        text,
+        ...(language ? { language } : {}),
+        ...(timed ? { words, segments: segments ?? segmentsOf(words) } : {}),
+        model: o.model,
+        vocabulary: vocab.length,
+      }
+    },
+  }
+}

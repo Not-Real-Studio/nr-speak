@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { alignWords, createGeminiTranscriber, createVertexTranscriber, guessLanguage, mergeVocabulary, parseInteraction, parseVertex, segmentsOf, sniffAudio, speakerLabel, transcribeBody, vertexTranscribeBody } from '../src/index.js'
+import { alignWords, createGeminiTranscriber, createOpenAITranscriber, createVertexTranscriber, guessLanguage, mergeVocabulary, parseInteraction, parseVertex, segmentsOf, sniffAudio, speakerLabel, transcribeBody, vertexTranscribeBody } from '../src/index.js'
 import { createListener, ffprobeOf, listenModelOf, listenerFromCtx, parseListenModel, truncatedAt } from '../src/node/index.js'
 import { fakeCtx, json } from './helpers.js'
 
@@ -176,7 +176,8 @@ describe('stt: node', () => {
     expect(listenModelOf('x-model')).toBe('x-model')
     expect(parseListenModel('vertex:gemini-3.5-transcribe')).toEqual({ engine: 'vertex', model: 'gemini-3.5-transcribe' })
     expect(parseListenModel('vertex:')).toEqual({ engine: 'vertex', model: 'gemini-3.5-transcribe-preview' })
-    expect(() => listenModelOf('openai:whisper-1')).toThrow(/не поддержан/)
+    expect(parseListenModel('openai:whisper-1')).toEqual({ engine: 'openai', model: 'whisper-1' })
+    expect(() => listenModelOf('azure:whisper-1')).toThrow(/не поддержан/)
   })
 
   it('из конфига: vertex: — проект провайдера vertex, токен; без проекта — ошибка', () => {
@@ -199,6 +200,39 @@ describe('stt: node', () => {
     const l = listenerFromCtx(fakeCtx({ provider: { google: { api_key: 'k' } }, speak: { listen_model: 'studio:gemini-3.5-transcribe-x' } }))
     expect(l.model).toBe('studio:gemini-3.5-transcribe-x')
     expect(() => listenerFromCtx(fakeCtx({}))).toThrow(/нет ключа AI Studio/)
+  })
+
+  it('openai: (llm-gate) — $listen_provider/$openai_provider, без модели и провайдера — ошибка', () => {
+    const ctx = fakeCtx({ provider: { gate: { base_url: 'https://g/v1', api_key: 'gk' } }, speak: { listen_model: 'openai:transcribe', openai_provider: 'gate' } })
+    expect(listenerFromCtx(ctx).model).toBe('openai:transcribe')
+    expect(() => parseListenModel('openai:')).toThrow(/нужна модель/)
+    expect(() => listenerFromCtx(fakeCtx({ speak: { listen_model: 'openai:t' } }))).toThrow(/не задан провайдер/)
+  })
+
+  it('createOpenAITranscriber: multipart verbose_json, слова со спикером, словарь — prompt', async () => {
+    let form: FormData | undefined
+    let auth = ''
+    const fetchMock = (async (url: string, init: RequestInit = {}) => {
+      expect(url).toBe('https://g/v1/audio/transcriptions')
+      auth = new Headers(init.headers).get('authorization') ?? ''
+      form = init.body as FormData
+      return json({ text: ' Привет мир ', language: 'russian', words: [{ word: 'Привет', start: 0, end: 0.5, speaker: 'A' }, { word: 'мир', start: 0.5, end: 1 }] })
+    }) as typeof fetch
+    const stt = createOpenAITranscriber({ baseUrl: 'https://g/v1/', apiKey: 'gk', model: 'transcribe', fetch: fetchMock })
+    const t = await stt.transcribe({ data: bytes('RIFF....WAVE'), mime: 'audio/wav' }, { diarize: true, vocabulary: ['Denis', 'runz'] })
+    expect(auth).toBe('Bearer gk')
+    expect(form?.get('model')).toBe('transcribe')
+    expect(form?.get('response_format')).toBe('verbose_json')
+    expect(form?.get('timestamp_granularities[]')).toBe('word')
+    expect(form?.get('diarize')).toBe('true')
+    expect(String(form?.get('prompt'))).toContain('Denis')
+    expect((form?.get('file') as File).name).toBe('audio.wav')
+    expect(t.text).toBe('Привет мир')
+    expect(t.language).toBe('ru')
+    expect(t.words).toEqual([{ text: 'Привет', start: 0, end: 0.5, speaker: 'A' }, { text: 'мир', start: 0.5, end: 1 }])
+    expect(t.segments?.length).toBeGreaterThan(0)
+    const bad = createOpenAITranscriber({ baseUrl: 'https://g', model: 'x', fetch: (async () => json({ error: { message: 'no provider' } }, 404)) as typeof fetch })
+    await expect(bad.transcribe({ data: bytes('x'), mime: 'audio/wav' })).rejects.toMatchObject({ status: 404 })
   })
 
   it('незнакомый формат — ffmpeg в mp3; большой — Files API (загрузка, uri в запрос, удаление)', async () => {

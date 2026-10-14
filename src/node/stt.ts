@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join } from 'node:path'
 import type { FfmpegRun } from '../audio.js'
 import type { SttEngine, Transcript, TranscribeOpts } from '../stt.js'
-import { TRANSCRIBE_MODEL, VERTEX_TRANSCRIBE_MODEL, createGeminiTranscriber, createVertexTranscriber, sniffAudio } from '../stt.js'
+import { TRANSCRIBE_MODEL, VERTEX_TRANSCRIBE_MODEL, createGeminiTranscriber, createOpenAITranscriber, createVertexTranscriber, sniffAudio } from '../stt.js'
 import { statusError } from '../types.js'
 import { gcloudToken, isVertex, providerOf, speakOpt } from './config.js'
 
@@ -166,7 +166,7 @@ export interface ListenerOpts {
   duration?: ((data: Uint8Array) => Promise<number | undefined>) | undefined
 }
 
-export const LISTEN_ENGINES = ['studio', 'vertex'] as const
+export const LISTEN_ENGINES = ['studio', 'vertex', 'openai'] as const
 export type ListenEngine = (typeof LISTEN_ENGINES)[number]
 
 /** `studio:gemini-3.5-transcribe` → движок и модель; без префикса — studio; пусто — модель по умолчанию движка. */
@@ -174,21 +174,34 @@ export function parseListenModel(name: string | undefined): { engine: ListenEngi
   const v = (name ?? '').trim()
   const m = /^([a-z]+):(.*)$/.exec(v)
   if (!m) return { engine: 'studio', model: v || TRANSCRIBE_MODEL }
-  if (!(LISTEN_ENGINES as readonly string[]).includes(m[1]!)) throw new Error(`listen: движок «${m[1]}» не поддержан — есть studio: (Gemini API, AI Studio), vertex: (Vertex AI)`)
+  if (!(LISTEN_ENGINES as readonly string[]).includes(m[1]!)) throw new Error(`listen: движок «${m[1]}» не поддержан — есть studio: (Gemini API, AI Studio), vertex: (Vertex AI), openai: (OpenAI-совместимый сервер — llm-gate)`)
   const engine = m[1] as ListenEngine
+  if (engine === 'openai' && !m[2]!.trim()) throw new Error('listen: openai: — нужна модель (алиас сервера: openai:transcribe)')
   return { engine, model: m[2]!.trim() || (engine === 'vertex' ? VERTEX_TRANSCRIBE_MODEL : TRANSCRIBE_MODEL) }
 }
 
 /** Имя модели без префикса (`studio:x` → `x`); незнакомый движок — ошибка. */
 export const listenModelOf = (name: string | undefined): string => parseListenModel(name).model
 
+/** Потолок звука OpenAI-совместимого сервера (как у OpenAI `/v1/audio/transcriptions`). */
+export const OPENAI_INLINE_MAX = 25 * 1024 * 1024
+
 /**
  * Транскрибер по конфигу: `studio:` — ключ провайдера AI Studio (`$studio_provider`, по умолчанию
  * `google`); `vertex:` — провайдер Vertex (`$vertex_provider`, по умолчанию `vertex`: `$project`,
- * `$location`, `$gcloud`).
+ * `$location`, `$gcloud`); `openai:<модель>` — OpenAI-совместимый сервер (llm-gate):
+ * `$listen_provider`, иначе `$openai_provider` (`$base_url`, `$api_key`).
  */
 export function listenerFromCtx(ctx: unknown, o: ListenerOpts & { token?: (() => Promise<string>) | undefined } = {}): Listener {
   const { engine, model } = parseListenModel(o.model ?? (speakOpt(ctx, 'listen_model') as string | undefined)?.toString())
+  if (engine === 'openai') {
+    const pname = ((speakOpt(ctx, 'listen_provider') ?? speakOpt(ctx, 'openai_provider')) as string | undefined)?.toString().trim()
+    if (!pname) throw new Error('listen: openai: — не задан провайдер ($listen_provider или $openai_provider в ## $speak ~/.runz/config.md)')
+    const p = providerOf(ctx, pname)
+    if (!p.baseUrl) throw new Error(`listen: у провайдера ${pname} нет $base_url (## $provider ${pname} ~/.runz/config.md)`)
+    const stt = createOpenAITranscriber({ baseUrl: p.baseUrl, model, ...(p.apiKey ? { apiKey: p.apiKey } : {}), ...(o.fetch ? { fetch: o.fetch } : {}) })
+    return listenerOver(stt, 'openai', { ...o, inlineMax: o.inlineMax ?? OPENAI_INLINE_MAX })
+  }
   if (engine === 'vertex') {
     const pname = (speakOpt(ctx, 'vertex_provider') as string | undefined)?.toString().trim() || 'vertex'
     const p = providerOf(ctx, pname)

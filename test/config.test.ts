@@ -29,6 +29,14 @@ describe('enginesFromCtx', () => {
     expect(() => enginesFromCtx(bad, { cache, token })).toThrow(/нужны \$base_url и \$model/)
   })
 
+  it('openai: $openai_model блока ## $speak — модель у провайдера без $model (llm-gate)', async () => {
+    const ctx = fakeCtx({ speak: { engines: 'openai', openai_provider: 'gate', openai_model: 'speech' }, provider: { gate: { base_url: 'https://g/v1', api_key: 'gk' } } })
+    let body: Record<string, unknown> = {}
+    const fetch = (async (_url: string, init: RequestInit = {}) => ((body = JSON.parse(String(init.body))), new Response(new Uint8Array([0xff, 0xfb, 0, 0])))) as typeof globalThis.fetch
+    for await (const _ of enginesFromCtx(ctx, { cache, fetch }).openai!.speak('привет', 'alloy', {})) break
+    expect(body.model).toBe('speech')
+  })
+
   it('без провайдеров — только edge', () => {
     expect(Object.keys(enginesFromCtx(fakeCtx({}), { cache }))).toEqual(['edge'])
   })

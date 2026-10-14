@@ -86,7 +86,9 @@ ffmpeg, остальное — ffmpeg (`ffmpegArgs`, темп — `atempo`).
 **Node.** `enginesFromCtx(ctx, {cache})` — движки из `~/.runz/config.md`: `vertex` и `chirp` —
 `## $provider vertex` с `$project` (токен `gcloud auth application-default print-access-token`,
 `$gcloud` — путь), `studio` — `## $provider google` с `$api_key`, `edge` — всегда, `openai` —
-`$openai_provider` блока `## $speak` → `## $provider <имя>` (`$base_url`, `$model`, `$api_key`),
+`$openai_provider` блока `## $speak` → `## $provider <имя>` (`$base_url`, `$model`, `$api_key`;
+модель — `$openai_model` блока `## $speak`, если у провайдера своей нет — llm-gate; звук приходит
+потоком — куски по мере ответа сервера, PCM по чётной границе),
 `$engines` — явный список. `engineFromCtx`/`providerOf`/`gcloudToken`/`fileCache` — прежний
 выбор одного движка сервиса voice nrchat (`$voice_provider`). `diskCache(dir)`,
 `ffmpegRunner(bin?)`, `ffmpegPipe(bin?)` (труба для потока).
@@ -146,6 +148,10 @@ const m = await listener.transcribe(bytes, { diarize: true, vocabulary })   // �
 inline (больше `INLINE_MAX` — ошибка 413). `parseListenModel('vertex:')` →
 `{engine: 'vertex', model: 'gemini-3.5-transcribe-preview'}`; `listenerOver(engine, prefix, opts)` —
 Listener над любым `SttEngine`. `retries: 0` — 429 сразу ошибкой (у потребителя есть фолбэк).
+`openai:<модель>` (DEV-283) — OpenAI-совместимый `/v1/audio/transcriptions` (llm-gate: алиас
+`$output: transcribe`, фолбэк — на гейте): провайдер `$listen_provider` ?? `$openai_provider`
+(`$base_url`, `$api_key`), multipart `verbose_json` + слова, словарь — `prompt`, `diarize`;
+до 25 МБ (`OPENAI_INLINE_MAX`). Без модели — ошибка. Клиент — `createOpenAITranscriber({baseUrl, apiKey?, model})`.
 
 ## Грабли
 
