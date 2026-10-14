@@ -67,7 +67,7 @@ export function gcloudToken(gcloud = 'gcloud'): () => Promise<string> {
   const PATH = [process.env.PATH ?? '', ...GCLOUD_DIRS].filter(Boolean).join(delimiter)
   return () =>
     new Promise((resolve, reject) => {
-      execFile(gcloud, ['auth', 'application-default', 'print-access-token'], { env: { ...process.env, PATH }, timeout: 30_000 }, (err, stdout, stderr) => {
+      execFile(gcloud, ['auth', 'application-default', 'print-access-token'], { env: { ...process.env, PATH }, timeout: 30_000, shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(gcloud) }, (err, stdout, stderr) => {
         if (err) reject(new Error(`voice: токен Vertex не получен (${gcloud} auth application-default print-access-token): ${String(stderr || err.message).trim().split('\n')[0]}`))
         else resolve(stdout.trim())
       })
