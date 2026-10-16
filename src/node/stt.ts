@@ -12,6 +12,8 @@ import { basename, delimiter, dirname, join } from 'node:path'
 import type { FfmpegRun } from '../audio.js'
 import type { SttEngine, Transcript, TranscribeOpts } from '../stt.js'
 import { TRANSCRIBE_MODEL, VERTEX_TRANSCRIBE_MODEL, createGeminiTranscriber, createOpenAITranscriber, createVertexTranscriber, sniffAudio } from '../stt.js'
+import type { LiveSocketCtor, LiveTranscribeOpts, LiveTranscription } from '../live.js'
+import { LIVE_TRANSCRIBE_MODEL, openLiveTranscription } from '../live.js'
 import { statusError } from '../types.js'
 import { gcloudToken, isVertex, providerOf, speakOpt } from './config.js'
 
@@ -251,5 +253,29 @@ export function listenerOver(engine: SttEngine, prefix: string, o: ListenerOpts,
         if (f && files) await deleteFile(files, f.name).catch(() => {})
       }
     },
+  }
+}
+
+/** Открыть поток распознавания: опции сессии без ключа и адреса — их даёт конфиг. */
+export type LiveOpener = (o: Omit<LiveTranscribeOpts, 'apiKey' | 'baseUrl'>) => LiveTranscription
+
+/**
+ * Поток `gemini-3.5-transcribe-live` (LLM-4) по конфигу: модель — `$listen_live_model`
+ * (`studio:gemini-3.5-transcribe-live` по умолчанию; только AI Studio — Live API Vertex для
+ * transcribe-live не проверен), ключ — провайдер AI Studio (`$studio_provider`, по умолчанию
+ * `google`), как у пакетного `studio:`.
+ */
+export function liveFromCtx(ctx: unknown, o: { model?: string | undefined; WebSocket?: LiveSocketCtor | undefined } = {}): { model: string; open: LiveOpener } {
+  const raw = (o.model ?? (speakOpt(ctx, 'listen_live_model') as string | undefined)?.toString() ?? '').trim()
+  const m = /^([a-z]+):(.*)$/.exec(raw)
+  if (m && m[1] !== 'studio') throw new Error(`listen live: движок «${m[1]}» не поддержан — только studio: (Live API AI Studio)`)
+  const model = (m ? m[2]! : raw).trim() || LIVE_TRANSCRIBE_MODEL
+  const pname = (speakOpt(ctx, 'studio_provider') as string | undefined)?.toString().trim() || 'google'
+  const p = providerOf(ctx, pname)
+  if (!p.apiKey || isVertex(p)) throw new Error(`listen live: нет ключа AI Studio ($api_key в ## $provider ${pname} ~/.runz/config.md)`)
+  const apiKey = p.apiKey
+  return {
+    model: `studio:${model}`,
+    open: (s) => openLiveTranscription({ ...s, apiKey, ...(p.baseUrl ? { baseUrl: p.baseUrl } : {}), model, ...(o.WebSocket ? { WebSocket: o.WebSocket } : {}) }),
   }
 }
