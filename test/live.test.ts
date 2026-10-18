@@ -120,6 +120,20 @@ describe('live: запись', () => {
     expect(ws.closed).toBe(true)
   })
 
+  it('финал обрезан провайдером (одна фраза из многих) — берётся услышанное interim', async () => {
+    const { live } = setupLive()
+    live.push(pcm())
+    await tick()
+    const ws = FakeSocket.all[0]!
+    ws.server({ setupComplete: {} })
+    await live.ready
+    const heard = 'Так, напомни мне, что за корпус? Что надо надиктовать? Давай я прямо сейчас надиктую на компьютер.'
+    ws.server({ serverContent: { interimInputTranscription: { text: heard } } })
+    const done = live.end()
+    ws.finalize('Так, напомни мне, что за корпус.')
+    expect(await done).toBe(heard)
+  })
+
   it('ротация сессии по времени: старая отдаёт финал, звук идёт в новую, текст склеен', async () => {
     const { live, events, advance } = setupLive({ sessionMs: 1000 })
     await tick()

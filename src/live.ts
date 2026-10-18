@@ -41,7 +41,7 @@ export interface LiveSocket {
 export type LiveSocketCtor = new (url: string) => LiveSocket
 
 export interface LiveEvent {
-  type: 'rotate' | 'reconnect' | 'goaway'
+  type: 'rotate' | 'reconnect' | 'goaway' | 'short-final'
   /** Номер новой сессии (первая — 1). */
   session: number
   reason?: string | undefined
@@ -149,6 +149,8 @@ interface Session {
   endAsked: boolean
   finals: string[]
   interim: string
+  /** Самый длинный interim сессии — страховка, если финал провайдера пришёл обрезанным. */
+  heard: string
   opened: number
   done: Promise<void>
   finish: () => void
@@ -201,7 +203,15 @@ export function openLiveTranscription(o: LiveTranscribeOpts): LiveTranscription 
     s.state = 'done'
     if (s.timer) clearTimeout(s.timer)
     // Финал есть — interim им уже покрыт; нет (таймаут, обрыв) — interim остаётся текстом.
-    if (s.finals.length) s.interim = ''
+    // Финал заметно короче услышанного (провайдер отдал только первый кусок, 18.10:
+    // 35 с речи → одна фраза) — берём услышанное.
+    const fin = joinText(s.finals)
+    if (s.finals.length && fin.length >= s.heard.length * 0.7) s.interim = ''
+    else if (s.heard.length > fin.length) {
+      if (s.finals.length) o.onEvent?.({ type: 'short-final', session: s.n, reason: `финал ${fin.length} симв. против услышанных ${s.heard.length}` })
+      s.finals = []
+      s.interim = s.heard
+    }
     try {
       s.ws.close(1000)
     } catch {
@@ -221,7 +231,7 @@ export function openLiveTranscription(o: LiveTranscribeOpts): LiveTranscription 
     let finish!: () => void
     const done = new Promise<void>((r) => (finish = r))
     const ws = new WS(url)
-    const s: Session = { n, ws, state: 'connecting', queue: [], endAsked: false, finals: [], interim: '', opened: now(), done, finish }
+    const s: Session = { n, ws, state: 'connecting', queue: [], endAsked: false, finals: [], interim: '', heard: '', opened: now(), done, finish }
     sessions.push(s)
     try {
       ws.binaryType = 'arraybuffer'
@@ -255,6 +265,7 @@ export function openLiveTranscription(o: LiveTranscribeOpts): LiveTranscription 
       const sc = msg.serverContent
       if (typeof sc?.interimInputTranscription?.text === 'string') {
         s.interim = sc.interimInputTranscription.text
+        if (s.interim.length > s.heard.length) s.heard = s.interim
         emit()
       }
       if (typeof sc?.inputTranscription?.text === 'string') {
@@ -262,7 +273,11 @@ export function openLiveTranscription(o: LiveTranscribeOpts): LiveTranscription 
         s.interim = ''
         emit()
       }
-      if (msg.voiceActivity?.type === 'ACTIVITY_END' && s.state === 'ending') finishSession(s)
+      // Финал может прийти несколькими кусками после ACTIVITY_END — короткая пауза, чтобы собрать все.
+      if (msg.voiceActivity?.type === 'ACTIVITY_END' && s.state === 'ending') {
+        if (s.timer) clearTimeout(s.timer)
+        s.timer = setTimeout(() => finishSession(s), 400)
+      }
       if (msg.goAway && s === cur && !ending) {
         o.onEvent?.({ type: 'goaway', session: n + 1, reason: msg.goAway.timeLeft })
         rotate()
