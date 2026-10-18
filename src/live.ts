@@ -109,6 +109,18 @@ const REGION: Record<string, string> = { ru: 'ru-RU', en: 'en-US', uk: 'uk-UA', 
 export const liveLanguage = (lang: string): string => (lang.includes('-') ? lang : (REGION[lang.toLowerCase()] ?? lang))
 
 /** Сообщение `setup` сессии. */
+/**
+ * Модель на тишине/смехе иногда «распознаёт» сам словарь: `'commit', 'deploy', 'merge', …`
+ * (18.10, корпус «улица»). Три и больше слов в кавычках через запятую подряд — это эхо словаря,
+ * а не речь: вырезается (оборванный хвост `, '` — тоже).
+ */
+export function dropVocabEcho(text: string): string {
+  return text
+    .replace(/(?:['‘’"«»][^'‘’"«»,\n]{1,40}['‘’"«»]\s*,\s*){2,}(?:['‘’"«»][^'‘’"«»,\n]{0,40}['‘’"«»]?)?/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
 export function liveSetup(o: Pick<LiveTranscribeOpts, 'model' | 'language' | 'vocabulary' | 'mode'>): Record<string, unknown> {
   const cfg: Record<string, unknown> = { mode: o.mode === 'verbatim' ? 'VERBATIM' : 'SMART' }
   if (o.language) cfg.languageCodes = [liveLanguage(o.language)]
@@ -185,7 +197,7 @@ export function openLiveTranscription(o: LiveTranscribeOpts): LiveTranscription 
   })
   ready.catch(() => {})
 
-  const text = (): string => joinText(sessions.map((s) => joinText([...s.finals, s.interim])))
+  const text = (): string => dropVocabEcho(joinText(sessions.map((s) => joinText([...s.finals, s.interim]))))
   const emit = (): void => {
     if (!closed) o.onPartial?.(text())
   }

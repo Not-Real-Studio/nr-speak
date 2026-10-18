@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { LiveSocket } from '../src/live.js'
-import { liveLanguage, liveSetup, liveUrl, openLiveTranscription, pcmToWav } from '../src/live.js'
+import { dropVocabEcho, liveLanguage, liveSetup, liveUrl, openLiveTranscription, pcmToWav } from '../src/live.js'
 
 /** Мок сокета Live API: записывает отправленное, сервер — методами теста. */
 class FakeSocket implements LiveSocket {
@@ -132,6 +132,12 @@ describe('live: запись', () => {
     const done = live.end()
     ws.finalize('Так, напомни мне, что за корпус.')
     expect(await done).toBe(heard)
+  })
+
+  it('эхо словаря на тишине (кавычки через запятую) вырезается, обычные кавычки — нет', () => {
+    expect(dropVocabEcho("'commit', 'deploy', 'merge', 'push', 'pull request', 'README', '")).toBe('')
+    expect(dropVocabEcho("Смеюсь. 'commit', 'deploy', 'merge', 'push' ладно")).toBe('Смеюсь. ladno'.replace('ladno', 'ладно'))
+    expect(dropVocabEcho('Он сказал «привет», и ушёл.')).toBe('Он сказал «привет», и ушёл.')
   })
 
   it('ротация сессии по времени: старая отдаёт финал, звук идёт в новую, текст склеен', async () => {
