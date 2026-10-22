@@ -48,6 +48,14 @@ export interface SpeakerOpts {
   ffmpeg?: FfmpegRun | undefined
   /** ffmpeg трубой — поток куска по мере синтеза; нет — кусок отдаётся целиком после синтеза. */
   ffmpegPipe?: FfmpegPipe | undefined
+  /**
+   * Хедж синтеза куска, мс (DEV-419): кусок не готов за это время — второй такой же запрос тем же
+   * движком и голосом, кто первый — тот и отдан, второй отменяется. Выбросы Vertex (26–52 с при
+   * p50 4 с) — зависший запрос, а не долгий синтез. 0 — без хеджа; по умолчанию 8000.
+   */
+  hedgeMs?: number | undefined
+  /** Хедж сработал (куда и чем кончился) — в лог сервера. */
+  onHedge?: ((e: { key: string; engine: string; winner: 'first' | 'hedge' | 'none'; ms: number }) => void) | undefined
 }
 
 export interface Speaker {
@@ -118,18 +126,20 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     const engine = o.engines[voice.engine]!
     const speed = speedOf(req)
     stats.synth++
-    const audio = await collect(
-      engine.speak(
-        text,
-        voice.voice,
-        {
-          ...(req.instruct?.trim() ? { instruct: req.instruct.trim() } : {}),
-          ...(engine.nativeSpeed && speed !== 1 ? { speed } : {}),
-          format: format === 'mp3' ? 'mp3' : 'pcm',
-        },
-        signal,
-      ),
-    )
+    const once = (sig?: AbortSignal) =>
+      collect(
+        engine.speak(
+          text,
+          voice.voice,
+          {
+            ...(req.instruct?.trim() ? { instruct: req.instruct.trim() } : {}),
+            ...(engine.nativeSpeed && speed !== 1 ? { speed } : {}),
+            format: format === 'mp3' ? 'mp3' : 'pcm',
+          },
+          sig,
+        ),
+      )
+    const audio = await hedged(once, o.hedgeMs ?? 8000, signal, (winner, ms) => o.onHedge?.({ key: k, engine: voice.engine, winner, ms }))
     const data = await convert(audio, format, { speed: engine.nativeSpeed ? 1 : speed, ffmpeg: o.ffmpeg })
     await o.cache?.set(k, data)
     return { data, contentType, cached: false, key: k, voice }
@@ -290,4 +300,59 @@ export async function streamAll(gen: AsyncIterable<Uint8Array>): Promise<Uint8Ar
   const parts: Uint8Array[] = []
   for await (const p of gen) parts.push(p)
   return concat(parts)
+}
+
+/**
+ * `run` с хеджем: не кончился за `ms` — второй такой же запуск; первый успешный — результат,
+ * остальные отменяются. Оба упали — первая по времени ошибка. `ms <= 0` — просто `run`.
+ */
+export async function hedged<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  signal?: AbortSignal,
+  onHedge?: (winner: 'first' | 'hedge' | 'none', ms: number) => void,
+): Promise<T> {
+  if (!(ms > 0)) return run(signal ?? new AbortController().signal)
+  const t0 = Date.now()
+  const ctls = [new AbortController(), new AbortController()]
+  const stopAll = (): void => ctls.forEach((c) => c.abort())
+  signal?.addEventListener('abort', stopAll, { once: true })
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      let failed = 0
+      let started = 1
+      let firstErr: unknown
+      let hedge: ReturnType<typeof setTimeout> | undefined
+      const launch = (n: 0 | 1): void => {
+        run(ctls[n]!.signal).then(
+          (v) => {
+            clearTimeout(hedge)
+            if (started > 1) onHedge?.(n === 0 ? 'first' : 'hedge', Date.now() - t0)
+            ctls[1 - n]!.abort()
+            resolve(v)
+          },
+          (err: unknown) => {
+            if (failed === 0) firstErr = err
+            failed++
+            if (n === 0 && started === 1) {
+              clearTimeout(hedge)
+              return reject(err)
+            }
+            if (failed >= started) {
+              onHedge?.('none', Date.now() - t0)
+              reject(firstErr)
+            }
+          },
+        )
+      }
+      launch(0)
+      hedge = setTimeout(() => {
+        if (signal?.aborted) return
+        started = 2
+        launch(1)
+      }, ms)
+    })
+  } finally {
+    signal?.removeEventListener('abort', stopAll)
+  }
 }
