@@ -14,6 +14,7 @@ import type { SttEngine, Transcript, TranscribeOpts } from '../stt.js'
 import { TRANSCRIBE_MODEL, VERTEX_TRANSCRIBE_MODEL, createGeminiTranscriber, createOpenAITranscriber, createVertexTranscriber, sniffAudio } from '../stt.js'
 import type { LiveSocketCtor, LiveTranscribeOpts, LiveTranscription } from '../live.js'
 import { LIVE_TRANSCRIBE_MODEL, openLiveTranscription } from '../live.js'
+import { openPollTranscription } from '../poll-live.js'
 import { statusError } from '../types.js'
 import { gcloudToken, isVertex, providerOf, speakOpt } from './config.js'
 
@@ -268,7 +269,17 @@ export type LiveOpener = (o: Omit<LiveTranscribeOpts, 'apiKey' | 'baseUrl'>) => 
 export function liveFromCtx(ctx: unknown, o: { model?: string | undefined; WebSocket?: LiveSocketCtor | undefined } = {}): { model: string; open: LiveOpener } {
   const raw = (o.model ?? (speakOpt(ctx, 'listen_live_model') as string | undefined)?.toString() ?? '').trim()
   const m = /^([a-z]+):(.*)$/.exec(raw)
-  if (m && m[1] !== 'studio') throw new Error(`listen live: движок «${m[1]}» не поддержан — только studio: (Live API AI Studio)`)
+  // `openai:<модель>` — псевдопоток по OpenAI-совместимому серверу (GigaAM на m4, 25.10);
+  // провайдер — `$listen_live_provider`, иначе `$listen_provider`, иначе `openai`.
+  if (m && m[1] === 'openai') {
+    const pname = (speakOpt(ctx, 'listen_live_provider') ?? speakOpt(ctx, 'listen_provider'))?.toString().trim() || 'openai'
+    const p = providerOf(ctx, pname)
+    if (!p.baseUrl) throw new Error(`listen live: нет $base_url в ## $provider ${pname} ~/.runz/config.md`)
+    const baseUrl = p.baseUrl
+    const model = m[2]!.trim()
+    return { model: raw, open: (s) => openPollTranscription({ baseUrl, apiKey: p.apiKey, model, rate: s.rate, language: s.language, onPartial: s.onPartial }) }
+  }
+  if (m && m[1] !== 'studio') throw new Error(`listen live: движок «${m[1]}» не поддержан — studio: (Live API AI Studio) или openai: (псевдопоток)`)
   const model = (m ? m[2]! : raw).trim() || LIVE_TRANSCRIBE_MODEL
   const pname = (speakOpt(ctx, 'studio_provider') as string | undefined)?.toString().trim() || 'google'
   const p = providerOf(ctx, pname)
