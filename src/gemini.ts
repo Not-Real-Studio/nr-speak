@@ -403,7 +403,7 @@ export function createGeminiEngine(o: GeminiOpts): TtsEngine {
       if (!design) throw new Error('voice.design: пустой дизайн')
       const lang = spec.lang?.trim() || 'en-US'
       const key = cacheKey(lang, design)
-      const hit = o.cache.get(key)
+      const hit = spec.fresh ? undefined : o.cache.get(key)
       if (hit) return { id: hit, cached: true }
       const gender = spec.gender === 'female' || spec.gender === 'male' ? spec.gender : design.toLowerCase().startsWith('female') ? 'female' : 'male'
       // Без voice.model: голос проектирует модель по умолчанию (Flash TTS), а id
@@ -428,7 +428,7 @@ export function createGeminiEngine(o: GeminiOpts): TtsEngine {
       }
       const id = String(((await res.json()) as { id?: unknown }).id ?? '')
       if (!id) throw new Error('voice.design: провайдер не вернул id голоса')
-      o.cache.set(key, id)
+      if (!spec.fresh) o.cache.set(key, id)
       return { id, cached: false }
     },
 

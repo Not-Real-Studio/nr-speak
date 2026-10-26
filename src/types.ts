@@ -46,6 +46,8 @@ export interface DesignSpec {
   lang?: string | undefined
   /** Подпись голоса у провайдера (кто это), не ключ кэша. */
   name?: string | undefined
+  /** Мимо кэша дизайнов: новый голос на то же описание (варианты мастерской). */
+  fresh?: boolean | undefined
 }
 
 export interface SpeakOpts {

@@ -69,6 +69,7 @@ describe('библиотека AI Studio', () => {
     expect(await resolveVoice(e, 'studio:voice_xyz')).toEqual({ engine: 'studio', voice: 'voice_xyz' })
     expect(await resolveVoice(e, 'studio:Kore')).toEqual({ engine: 'studio', voice: 'Kore' })
     expect(await resolveVoice(e, 'Podcaster 1')).toEqual({ engine: 'studio', voice: 'en-us-podcaster-1' })
+    await expect(resolveVoice(e, 'vertex:en-us-podcaster-1')).rejects.toThrow(/Vertex его не знает: studio:en-us-podcaster-1/)
   })
 
   it('фильтр: пол, язык префиксом, подстрока', () => {

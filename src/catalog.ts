@@ -7,7 +7,7 @@
  * только с префиксом, иначе это студийный голос Vertex).
  */
 
-import { STUDIO_VOICES, studioVoice } from './gemini.js'
+import { STUDIO_VOICES, VERTEX_NO_LIBRARY, studioVoice } from './gemini.js'
 import type { TtsEngine, VoiceInfo } from './types.js'
 
 export const ENGINE_NAMES = ['vertex', 'studio', 'chirp', 'edge', 'openai'] as const
@@ -114,6 +114,7 @@ async function within(engines: Engines, n: EngineName, voice: string): Promise<R
   if (n === 'openai') return { engine: n, voice }
   const ids = await idsOf(n, e)
   const hit = matchVoice(ids, voice)
+  if (!hit && n === 'vertex' && /^[a-z]{2,3}-[a-z0-9]+-/.test(voice)) throw new Error(`speak: ${VERTEX_NO_LIBRARY(voice)}`)
   if (!hit) throw new Error(`speak: у движка ${n} нет голоса «${voice}»`)
   return { engine: n, voice: hit }
 }
