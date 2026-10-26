@@ -17,3 +17,5 @@ export { BOOK_FORMATS, BOOK_MAX_BYTES, NO_TEXT_LAYER, bookToMarkdown, docxToMark
 export type { Book, BookFormat, BookOpts } from './book.js'
 export { CLEAN_FILTER, VOICES_DIR, cleanSample, entryOf, fileCollection, fileLibraryCache, parseVoiceMdz, slugOf, voiceMdz } from './voices.js'
 export type { CollectionEntry, FileCollection } from './voices.js'
+export { SAY_DEFAULT_VOICE, createSayEngine, hasSay, parseSayVoices } from './say.js'
+export type { SayEngineOpts } from './say.js'

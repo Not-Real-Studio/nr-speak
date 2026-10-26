@@ -14,7 +14,9 @@ describe('enginesFromCtx', () => {
       },
     })
     const e = enginesFromCtx(ctx, { cache, token })
-    expect(Object.keys(e).sort()).toEqual(['chirp', 'edge', 'studio', 'vertex'])
+    expect(Object.keys(e).filter((k) => k !== 'say').sort()).toEqual(['chirp', 'edge', 'studio', 'vertex'])
+    // Локальный `say` — только на macOS (DEV-513).
+    expect('say' in e).toBe(process.platform === 'darwin')
     expect(e.vertex!.kind).toBe('vertex')
     expect(e.studio!.kind).toBe('gemini')
   })
@@ -24,7 +26,7 @@ describe('enginesFromCtx', () => {
       speak: { engines: 'edge, openai', openai_provider: 'mlx' },
       provider: { vertex: { type: 'vertex', project: 'p1' }, mlx: { base_url: 'http://127.0.0.1:8000/v1', model: 'qwen3-tts' } },
     })
-    expect(Object.keys(enginesFromCtx(ctx, { cache, token })).sort()).toEqual(['edge', 'openai'])
+    expect(Object.keys(enginesFromCtx(ctx, { cache, token })).filter((k) => k !== 'say').sort()).toEqual(['edge', 'openai'])
     const bad = fakeCtx({ speak: { openai_provider: 'mlx' }, provider: { mlx: { base_url: 'http://h' } } })
     expect(() => enginesFromCtx(bad, { cache, token })).toThrow(/нужны \$base_url и \$model/)
   })
@@ -38,7 +40,7 @@ describe('enginesFromCtx', () => {
   })
 
   it('без провайдеров — только edge', () => {
-    expect(Object.keys(enginesFromCtx(fakeCtx({}), { cache }))).toEqual(['edge'])
+    expect(Object.keys(enginesFromCtx(fakeCtx({}), { cache })).filter((k) => k !== 'say')).toEqual(['edge'])
   })
 
   it('speakOpt: блок ## $speak или корневой $speak_<имя>; listOf — массив, IArray, строка', () => {

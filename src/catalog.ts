@@ -1,7 +1,7 @@
 /**
  * Каталог голосов всех настроенных движков и резолв имён. Полное имя — с префиксом
  * движка: `vertex:Kore`, `studio:voice_…`, `chirp:ru-RU-Chirp3-HD-Aoede`,
- * `edge:ru-RU-SvetlanaNeural`, `openai:<голос>`. Короткое имя ищется по порядку
+ * `edge:ru-RU-SvetlanaNeural`, `openai:<голос>`, `say:Milena` (macOS, без сети). Короткое имя ищется по порядку
  * Vertex → Studio → Chirp → Edge → OpenAI: точное совпадение id (без регистра), затем
  * однозначное совпадение части id (`Svetlana` → `ru-RU-SvetlanaNeural`, `Aoede` в Chirp —
  * только с префиксом, иначе это студийный голос Vertex).
@@ -10,11 +10,11 @@
 import { STUDIO_VOICES, VERTEX_NO_LIBRARY, studioVoice } from './gemini.js'
 import type { TtsEngine, VoiceInfo } from './types.js'
 
-export const ENGINE_NAMES = ['vertex', 'studio', 'chirp', 'edge', 'openai'] as const
+export const ENGINE_NAMES = ['vertex', 'studio', 'chirp', 'edge', 'openai', 'say'] as const
 export type EngineName = (typeof ENGINE_NAMES)[number]
 export type Tier = 'free' | 'cheap' | 'premium' | 'local'
 
-export const ENGINE_TIER: Record<EngineName, Tier> = { vertex: 'premium', studio: 'cheap', chirp: 'free', edge: 'free', openai: 'local' }
+export const ENGINE_TIER: Record<EngineName, Tier> = { vertex: 'premium', studio: 'cheap', chirp: 'free', edge: 'free', openai: 'local', say: 'local' }
 
 /** Настроенные движки по имени; отсутствующий — не настроен. */
 export type Engines = Partial<Record<EngineName, TtsEngine>>

@@ -53,6 +53,11 @@ const one = await speaker.synth('Привет', { voice: 'chirp:Aoede', speed: 1
 без регистра, затем однозначная часть: `Svetlana` → `edge:ru-RU-SvetlanaNeural`,
 `chirp:Aoede` → `chirp:ru-RU-Chirp3-HD-Aoede`).
 
+**Без сети (DEV-513).** `say` — системный синтез macOS (`./node`: `createSayEngine`, голоса
+`say -v '?'`, по умолчанию `Milena`, `$say_voice` блока `## $speak`); `enginesFromCtx` включает
+его сам на darwin (`$engines` — выключить). Звук — WAV, темп — перекодировщиком. Piper — следующий
+кандидат тем же контрактом (звучит лучше, но ставится отдельно).
+
 **Нормализатор L0.** `l0Markdown(md, opts)` / `l0Text(text, opts)` → `{title, blocks: [{kind, text}]}`;
 `blocksText(blocks)` — текст для глаз (`--print`). Выкидывает frontmatter, картинки, адреса
 ссылок, голые URL, сноски, HTML и мусор-токены (`stripTokens`, всегда): hex от 7 символов с

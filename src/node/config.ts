@@ -15,6 +15,7 @@ import { createChirpEngine } from '../chirp.js'
 import type { EdgeClient } from '../edge.js'
 import { createEdgeEngine } from '../edge.js'
 import { createOpenAIEngine } from '../openai.js'
+import { createSayEngine, hasSay } from './say.js'
 
 /** Структурно — `IContext` runz: сервису нужен только `get`. */
 interface Ctx {
@@ -204,6 +205,11 @@ export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
     if (!p.baseUrl || !model) throw new Error(`speak: у провайдера ${oname} нужны $base_url и $model (или $openai_model в ## $speak) (## $provider ${oname} ~/.runz/config.md)`)
     const voices = listOf(speakOpt(ctx, 'openai_voices'))
     out.openai = createOpenAIEngine({ baseUrl: p.baseUrl, model, ...(p.apiKey ? { apiKey: p.apiKey } : {}), ...(voices ? { voices, defaultVoice: voices[0] } : {}), ...common })
+  }
+  // Локальный без сети (DEV-513): macOS `say`; `$say_voice` — голос по умолчанию.
+  if (on('say') && hasSay()) {
+    const sv = str(speakOpt(ctx, 'say_voice'))
+    out.say = createSayEngine(sv ? { defaultVoice: sv } : {})
   }
   return out
 }
