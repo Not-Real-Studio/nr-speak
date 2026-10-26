@@ -4,11 +4,12 @@
  * клона ffmpeg.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { CollectionVoice, VoiceCollection } from '../speaker.js'
 import type { FfmpegRun } from '../audio.js'
+import { concat, wavHeader } from '../audio.js'
 import type { LibraryCache, VoiceInfo } from '../types.js'
 
 export const VOICES_DIR = join(homedir(), 'Studio', 'envs', 'voices')
@@ -223,8 +224,21 @@ export function fileLibraryCache(file: string, ttl = 24 * 3600_000, now: () => n
 /** Фильтр чистки записи для клона (тихий Диктофон −42 дБ: иначе согласие не распознаётся). */
 export const CLEAN_FILTER = 'highpass=f=80,lowpass=f=11000,afftdn=nr=18,loudnorm=I=-20:TP=-2:LRA=11'
 
-/** Запись (m4a, wav, что угодно) → WAV 24 кГц моно s16, чистка `CLEAN_FILTER` (`clean: false` — без неё). */
+/**
+ * Запись (m4a, wav, что угодно) → WAV 24 кГц моно s16 с честным заголовком, чистка `CLEAN_FILTER`
+ * (`clean: false` — без неё). Вход — временным файлом: m4a с Диктофона держит moov в конце, из
+ * трубы ffmpeg его не читает (пустой звук).
+ */
 export async function cleanSample(ffmpeg: FfmpegRun, audio: Uint8Array, o: { clean?: boolean } = {}): Promise<Uint8Array> {
   const af = o.clean === false ? [] : ['-af', CLEAN_FILTER]
-  return ffmpeg(['-i', 'pipe:0', ...af, '-ar', '24000', '-ac', '1', '-sample_fmt', 's16', '-f', 'wav', 'pipe:1'], audio)
+  const dir = mkdtempSync(join(tmpdir(), 'speak-sample-'))
+  const file = join(dir, 'in')
+  try {
+    writeFileSync(file, audio)
+    const out = await ffmpeg(['-i', file, ...af, '-ar', '24000', '-ac', '1', '-sample_fmt', 's16', '-f', 's16le', 'pipe:1'], new Uint8Array())
+    if (out.length < 24000 * 2) throw new Error(`speak: в записи меньше секунды звука (${out.length} байт после ffmpeg)`)
+    return concat([wavHeader(24000, out.length), out])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }
