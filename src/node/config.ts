@@ -8,7 +8,7 @@
 import { execFile } from 'node:child_process'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { delimiter } from 'node:path'
-import type { TtsEngine, VoiceCache } from '../types.js'
+import type { LibraryCache, TtsEngine, VoiceCache } from '../types.js'
 import { createGeminiEngine, createRoutedEngine, createVertexEngine } from '../gemini.js'
 import type { EngineName, Engines } from '../catalog.js'
 import { createChirpEngine } from '../chirp.js'
@@ -167,6 +167,8 @@ export interface EnginesFromCtxOpts {
   token?: (() => Promise<string>) | undefined
   /** Подмена клиента Edge (тесты). */
   edge?: EdgeClient | undefined
+  /** Кэш библиотеки готовых голосов AI Studio (`fileLibraryCache`). */
+  libraryCache?: LibraryCache | undefined
 }
 
 /**
@@ -190,7 +192,7 @@ export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
   const g = providerOf(ctx, str(speakOpt(ctx, 'studio_provider')) ?? 'google')
   if (on('studio') && g.apiKey && !isVertex(g)) {
     const model = str(speakOpt(ctx, 'studio_model'))
-    out.studio = createGeminiEngine({ apiKey: g.apiKey, ...(g.baseUrl ? { baseUrl: g.baseUrl } : {}), cache: o.cache, ...(model ? { model } : {}), ...common })
+    out.studio = createGeminiEngine({ apiKey: g.apiKey, ...(g.baseUrl ? { baseUrl: g.baseUrl } : {}), cache: o.cache, ...(model ? { model } : {}), ...(o.libraryCache ? { libraryCache: o.libraryCache } : {}), ...common })
   }
   if (on('chirp') && token && v.project) out.chirp = createChirpEngine({ project: v.project, token, ...common })
   if (on('edge')) out.edge = createEdgeEngine(o.edge ? { client: o.edge } : {})

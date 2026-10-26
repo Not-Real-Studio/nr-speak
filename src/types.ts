@@ -14,6 +14,28 @@ export interface VoiceInfo {
   /** Описание дизайна (prompted) — по нему видно, чей это голос. */
   design?: string
   expires?: string
+  /** Библиотека провайдера (Gemini `prebuilt`): высота, акцент, амплуа, контекст, описание. */
+  pitch?: string
+  accent?: string
+  persona?: string
+  context?: string
+  description?: string
+}
+
+/** Клон голоса по записи (Gemini Voice replication). */
+export interface ReplicateSpec {
+  /** Подпись у провайдера. */
+  name: string
+  /** Образец 10–30 с и фраза согласия — WAV 24 кГц моно s16 (чистка — до вызова). */
+  source: Uint8Array
+  consent: Uint8Array
+  lang?: string | undefined
+}
+
+/** Кэш списка библиотеки (сутки на диске у Node — `fileLibraryCache`). */
+export interface LibraryCache {
+  get(): Promise<VoiceInfo[] | undefined>
+  set(list: VoiceInfo[]): Promise<void>
 }
 
 export interface DesignSpec {
@@ -55,6 +77,12 @@ export interface TtsEngine {
   /** Свои голоса проекта (в счёт лимита); `prebuilt` — ещё и каталог провайдера. */
   voices(opts?: { prebuilt?: boolean }): Promise<VoiceInfo[]>
   design(spec: DesignSpec): Promise<{ id: string; cached: boolean }>
+  /** Клон по записи (только Gemini AI Studio). */
+  replicate?(spec: ReplicateSpec): Promise<{ id: string }>
+  /** Удалить свой голос у провайдера (мастерская: лишние варианты). */
+  remove?(id: string): Promise<void>
+  /** Библиотека готовых голосов провайдера (Gemini — тысячи, с кэшем). */
+  library?(o?: { fresh?: boolean }): Promise<VoiceInfo[]>
   speak(text: string, voiceId: string, opts: SpeakOpts, signal?: AbortSignal): AsyncIterable<AudioChunk>
 }
 

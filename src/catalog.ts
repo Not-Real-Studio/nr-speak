@@ -7,8 +7,8 @@
  * только с префиксом, иначе это студийный голос Vertex).
  */
 
-import { STUDIO_VOICES } from './gemini.js'
-import type { TtsEngine } from './types.js'
+import { STUDIO_VOICES, studioVoice } from './gemini.js'
+import type { TtsEngine, VoiceInfo } from './types.js'
 
 export const ENGINE_NAMES = ['vertex', 'studio', 'chirp', 'edge', 'openai'] as const
 export type EngineName = (typeof ENGINE_NAMES)[number]
@@ -93,6 +93,10 @@ export async function resolveVoice(engines: Engines, name: string | undefined, o
     const hit = matchVoice(await idsOf(n, e).catch(() => []), raw)
     if (hit) return { engine: n, voice: hit }
   }
+  // Последним — библиотека AI Studio по id или имени (`Neno`, `Neno (ja-JP)`).
+  const lib = engines.studio?.library ? await engines.studio.library().catch(() => []) : []
+  const fromLib = matchLibrary(lib, raw)
+  if (fromLib) return { engine: 'studio', voice: fromLib.id }
   throw new Error(`speak: голос «${raw}» не найден ни в одном движке (${configured(engines)}); полный список — voices`)
 }
 
@@ -100,12 +104,54 @@ async function within(engines: Engines, n: EngineName, voice: string): Promise<R
   const e = engines[n]
   if (!e) throw new Error(`speak: движок «${n}» не настроен (есть: ${configured(engines)})`)
   if (!voice) return { engine: n, voice: '' }
-  // Свои голоса и OpenAI — как есть: их список не обязан быть полным.
-  if (n === 'studio' || n === 'openai') return { engine: n, voice }
+  // Studio: свой `voice_…` и студийный — как есть; иначе — библиотека (id или имя), не нашлось — как есть.
+  if (n === 'studio') {
+    if (voice.startsWith('voice_') || studioVoice(voice) || !e.library) return { engine: n, voice }
+    const hit = matchLibrary(await e.library(), voice)
+    return { engine: n, voice: hit?.id ?? voice }
+  }
+  // OpenAI — как есть: его список не обязан быть полным.
+  if (n === 'openai') return { engine: n, voice }
   const ids = await idsOf(n, e)
   const hit = matchVoice(ids, voice)
   if (!hit) throw new Error(`speak: у движка ${n} нет голоса «${voice}»`)
   return { engine: n, voice: hit }
+}
+
+/**
+ * Голос библиотеки по id (`ja-jp-neno`, без регистра) или имени (`display_name`); одно имя у
+ * нескольких языков — нужен язык: `Neno (ja-JP)` или `ja-JP/Neno`, иначе ошибка со списком.
+ */
+export function matchLibrary(list: readonly VoiceInfo[], name: string): VoiceInfo | undefined {
+  const n = name.trim().toLowerCase()
+  const byId = list.find((v) => v.id.toLowerCase() === n)
+  if (byId) return byId
+  const m = /^(.+?)\s*\(([a-z]{2,3}(?:-[a-z0-9]+)?)\)$/i.exec(name.trim()) ?? /^([a-z]{2,3}-[a-z0-9]+)\/(.+)$/i.exec(name.trim())
+  const [who, lang] = m ? (m[0].includes('/') ? [m[2]!, m[1]!] : [m[1]!, m[2]!]) : [name.trim(), '']
+  const hits = list.filter((v) => (v.name ?? '').toLowerCase() === who.toLowerCase() && (!lang || (v.lang ?? '').toLowerCase() === lang.toLowerCase()))
+  if (hits.length > 1) throw new Error(`speak: голос «${name}» есть в нескольких языках: ${hits.map((v) => `${v.name} (${v.lang}) = ${v.id}`).join(', ')}`)
+  return hits[0]
+}
+
+export interface LibraryFilter {
+  gender?: string | undefined
+  /** Префикс языка: `ja`, `ja-JP`. */
+  lang?: string | undefined
+  /** Подстрока в id, имени, описании, амплуа, акценте. */
+  q?: string | undefined
+}
+
+/** Библиотека с фильтром (CLI `voices --library`, стенд). */
+export function filterLibrary(list: readonly VoiceInfo[], f: LibraryFilter): VoiceInfo[] {
+  const q = f.q?.trim().toLowerCase()
+  const lang = f.lang?.trim().toLowerCase()
+  const gender = f.gender?.trim().toLowerCase()
+  return list.filter(
+    (v) =>
+      (!gender || (v.gender ?? '').toLowerCase() === gender) &&
+      (!lang || (v.lang ?? '').toLowerCase().startsWith(lang)) &&
+      (!q || [v.id, v.name, v.description, v.persona, v.accent, v.context].some((x) => x?.toLowerCase().includes(q))),
+  )
 }
 
 const configured = (engines: Engines): string => ENGINE_NAMES.filter((n) => engines[n]).join(', ') || 'ни одного'

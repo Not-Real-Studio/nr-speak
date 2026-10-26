@@ -12,7 +12,8 @@
  * инъекцией `fetch`, кэш дизайнов — инъекцией `VoiceCache`.
  */
 
-import type { AudioChunk, DesignSpec, SpeakOpts, TtsEngine, VoiceCache, VoiceInfo } from './types.js'
+import type { AudioChunk, DesignSpec, LibraryCache, ReplicateSpec, SpeakOpts, TtsEngine, VoiceCache, VoiceInfo } from './types.js'
+import { concat, parseWav, wavHeader } from './audio.js'
 
 /** Повторы синтеза на 429 — у обоих движков одинаково. */
 export interface RetryOpts {
@@ -35,6 +36,10 @@ export interface GeminiOpts extends RetryOpts {
   fetch?: typeof fetch | undefined
   /** Лимит голосов проекта у провайдера (200 у Gemini). */
   limit?: number | undefined
+  /** Кэш библиотеки готовых голосов (2000+ записей, сутки); нет — каждый раз из API. */
+  libraryCache?: LibraryCache | undefined
+  /** Модель, к которой привязывается клон (`replicated`). */
+  replicateModel?: string | undefined
 }
 
 export interface VertexOpts extends RetryOpts {
@@ -100,9 +105,69 @@ export function designFor(design: string, lang: string): string {
   return lang.toLowerCase().startsWith('en') ? design : design.replace(/,\s*(American|British) accent/g, '')
 }
 
-/** `voiceConfig`: свой `voice_…` — по id, иначе имя встроенного голоса. */
+/** Студийный голос (`Kore`, `charon`) — каноническое имя; иначе undefined. */
+export function studioVoice(id: string): string | undefined {
+  const n = id.toLowerCase()
+  return STUDIO_VOICES.find((v) => v.id.toLowerCase() === n)?.id
+}
+
+/**
+ * `voiceConfig`: студийный — по имени (`prebuiltVoiceConfig`), всё остальное — свой `voice_…`
+ * и голос библиотеки (`en-us-neno`) — по id (`voice`).
+ */
 export function voiceConfig(id: string): Record<string, unknown> {
-  return id.startsWith('voice_') ? { voice: id } : { prebuiltVoiceConfig: { voiceName: id } }
+  const studio = studioVoice(id)
+  return studio ? { prebuiltVoiceConfig: { voiceName: studio } } : { voice: id }
+}
+
+/** Библиотечный голос AI Studio (не студийный и не свой) — Vertex его не знает. */
+export const VERTEX_NO_LIBRARY = (id: string): string => `голос «${id}» — из библиотеки AI Studio, Vertex его не знает: studio:${id}`
+
+type ApiVoice = {
+  id?: string
+  type?: string
+  display_name?: string
+  gender?: string
+  language_code?: string
+  prompted?: { input?: string }
+  expire_time?: string
+  pitch?: string
+  accent?: string
+  persona?: string
+  context?: string
+  description?: string
+}
+
+/** Запись API голосов → `VoiceInfo` (пустые поля не переносятся). */
+export function voiceInfoOf(v: ApiVoice & { id: string }): VoiceInfo {
+  return {
+    id: v.id,
+    ...(v.type ? { type: v.type } : {}),
+    ...(v.display_name ? { name: v.display_name } : {}),
+    ...(v.gender ? { gender: v.gender } : {}),
+    ...(v.language_code ? { lang: v.language_code } : {}),
+    ...(v.prompted?.input ? { design: v.prompted.input } : {}),
+    ...(v.expire_time ? { expires: v.expire_time } : {}),
+    ...(v.pitch ? { pitch: v.pitch } : {}),
+    ...(v.accent ? { accent: v.accent } : {}),
+    ...(v.persona ? { persona: v.persona } : {}),
+    ...(v.context ? { context: v.context } : {}),
+    ...(v.description ? { description: v.description } : {}),
+  }
+}
+
+/** WAV с честным заголовком из любого WAV (стримовый размер, LIST-чанки) или сырого PCM s16 24 кГц. */
+export function cleanWav(d: Uint8Array): Uint8Array {
+  const { pcm, rate } = parseWav(d)
+  return concat([wavHeader(rate, pcm.length), pcm])
+}
+
+/** Ошибки клона — человеческим текстом (провайдер отвечает «invalid argument» на всё). */
+export function replicateError(status: number, message: string): string {
+  if (/consent/i.test(message)) return `согласие не распознано — фраза согласия должна звучать чётко и тем же голосом, что образец (${message})`
+  if (/disabled|not enabled|permission/i.test(message)) return `клонирование выключено у проекта (${message})`
+  if (status === 400) return `провайдер отклонил запись (${message || 'invalid argument'}): нужен WAV 24 кГц моно s16 с честным заголовком, образец 10–30 с, согласие — фраза целиком`
+  return message || `HTTP ${status}`
 }
 
 function b64decode(s: string): Uint8Array {
@@ -267,40 +332,71 @@ export function createGeminiEngine(o: GeminiOpts): TtsEngine {
   const limit = o.limit ?? GEMINI_VOICE_LIMIT
   const headers = { 'x-goog-api-key': o.apiKey, 'content-type': 'application/json' }
 
-  async function voices(opts: { prebuilt?: boolean } = {}): Promise<VoiceInfo[]> {
+  async function list(filter: string, keep: (v: ApiVoice) => boolean): Promise<VoiceInfo[]> {
     const out: VoiceInfo[] = []
     let token = ''
     // Каталог встроенных голосов — тысячи записей: страницы по 1000.
     for (let page = 0; page < 50; page++) {
-      const res = await http(`${root}/v1beta/voices?pageSize=1000${token ? `&pageToken=${encodeURIComponent(token)}` : ''}`, { headers })
+      const res = await http(`${root}/v1beta/voices?pageSize=1000${filter}${token ? `&pageToken=${encodeURIComponent(token)}` : ''}`, { headers })
       if (!res.ok) throw await failure(res, 'voice.voices')
-      const body = (await res.json()) as {
-        voices?: { id?: string; type?: string; display_name?: string; gender?: string; language_code?: string; prompted?: { input?: string }; expire_time?: string }[]
-        next_page_token?: string
-        nextPageToken?: string
-      }
-      for (const v of body.voices ?? []) {
-        if (!v.id || (v.type === 'prebuilt' && !opts.prebuilt)) continue
-        out.push({
-          id: v.id,
-          ...(v.type ? { type: v.type } : {}),
-          ...(v.display_name ? { name: v.display_name } : {}),
-          ...(v.gender ? { gender: v.gender } : {}),
-          ...(v.language_code ? { lang: v.language_code } : {}),
-          ...(v.prompted?.input ? { design: v.prompted.input } : {}),
-          ...(v.expire_time ? { expires: v.expire_time } : {}),
-        })
-      }
+      const body = (await res.json()) as { voices?: ApiVoice[]; next_page_token?: string; nextPageToken?: string }
+      for (const v of body.voices ?? []) if (v.id && keep(v)) out.push(voiceInfoOf(v as ApiVoice & { id: string }))
       token = body.next_page_token ?? body.nextPageToken ?? ''
       if (!token) break
     }
     return out
   }
 
+  const voices = (opts: { prebuilt?: boolean } = {}): Promise<VoiceInfo[]> => list('', (v) => v.type !== 'prebuilt' || !!opts.prebuilt)
+
+  async function library(lo: { fresh?: boolean } = {}): Promise<VoiceInfo[]> {
+    if (!lo.fresh) {
+      const hit = await o.libraryCache?.get()
+      if (hit?.length) return hit
+    }
+    const got = await list('&type=prebuilt', (v) => v.type === 'prebuilt')
+    if (got.length) await o.libraryCache?.set(got)
+    return got
+  }
+
   return {
     kind: 'gemini',
     limit,
     voices,
+    library,
+
+    async replicate(spec: ReplicateSpec) {
+      if (!spec.source.length || !spec.consent.length) throw new Error('voice.replicate: нужны образец и согласие')
+      // Честный заголовок WAV: ffmpeg в трубу пишет размер 0xFFFFFFFF — на нём REST отвечает 400.
+      const b64 = (d: Uint8Array): string => b64encode(cleanWav(d))
+      const body = {
+        store: true,
+        voice: {
+          type: 'replicated',
+          model: o.replicateModel ?? VERTEX_TTS_MODEL,
+          display_name: spec.name.trim().slice(0, 60) || 'clone',
+          ...(spec.lang ? { language_code: spec.lang } : {}),
+          replicated: { source_audio: { mime_type: 'audio/wav', data: b64(spec.source) }, consent_audio: { mime_type: 'audio/wav', data: b64(spec.consent) } },
+        },
+      }
+      const res = await http(`${root}/v1beta/voices`, { method: 'POST', headers, body: JSON.stringify(body) })
+      if (!res.ok) {
+        const err = await failure(res, 'voice.replicate')
+        const msg = err.message.replace(/^voice\.replicate: HTTP \d+( — )?/, '')
+        const out = new Error(`voice.replicate: ${replicateError(res.status, msg)}`)
+        ;(out as Error & { status?: number }).status = res.status
+        throw out
+      }
+      const id = String(((await res.json()) as { id?: unknown }).id ?? '')
+      if (!id) throw new Error('voice.replicate: провайдер не вернул id голоса')
+      return { id }
+    },
+
+    async remove(id: string) {
+      if (!id.startsWith('voice_')) throw new Error(`voice.remove: «${id}» — не свой голос`)
+      const res = await http(`${root}/v1beta/voices/${encodeURIComponent(id)}`, { method: 'DELETE', headers })
+      if (!res.ok && res.status !== 404) throw await failure(res, 'voice.remove')
+    },
 
     async design(spec) {
       const design = spec.design.trim()
@@ -401,6 +497,7 @@ export function createVertexEngine(o: VertexOpts): TtsEngine {
     async *speak(text, voiceId, opts, signal) {
       const voice = voiceId || o.defaultVoice || VERTEX_DEFAULT_VOICE
       if (voice.startsWith('voice_')) throw new Error(`voice.speak: ${VERTEX_NO_CUSTOM}`)
+      if (!studioVoice(voice)) throw new Error(`voice.speak: ${VERTEX_NO_LIBRARY(voice)}`)
       yield* speakStream({
         http,
         url,
@@ -461,7 +558,8 @@ export function b64encode(data: Uint8Array): string {
  * плюс каталог Vertex. Так Tavern/nr-play сохраняют голоса персонажей при Vertex по умолчанию.
  */
 export function createRoutedEngine(studio: TtsEngine, vertex: TtsEngine): TtsEngine {
-  const pick = (voice: string): TtsEngine => (voice.startsWith('voice_') ? studio : vertex)
+  // Студийный (и пустой — голос по умолчанию Vertex) — Vertex; свой и библиотечный — AI Studio.
+  const pick = (voice: string): TtsEngine => (!voice || studioVoice(voice) ? vertex : studio)
   return {
     kind: 'routed',
     ...(studio.limit !== undefined ? { limit: studio.limit } : {}),
@@ -470,6 +568,9 @@ export function createRoutedEngine(studio: TtsEngine, vertex: TtsEngine): TtsEng
       return opts?.prebuilt ? [...own, ...(await vertex.voices({ prebuilt: true }))] : own
     },
     design: (spec) => studio.design(spec),
+    ...(studio.replicate ? { replicate: (spec: ReplicateSpec) => studio.replicate!(spec) } : {}),
+    ...(studio.remove ? { remove: (id: string) => studio.remove!(id) } : {}),
+    ...(studio.library ? { library: (lo?: { fresh?: boolean }) => studio.library!(lo) } : {}),
     speak: (text, voice, opts, signal) => pick(voice).speak(text, voice, opts, signal),
   }
 }

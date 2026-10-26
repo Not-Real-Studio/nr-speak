@@ -54,6 +54,11 @@ export interface SpeakerOpts {
    * p50 4 с) — зависший запрос, а не долгий синтез. 0 — без хеджа; по умолчанию 8000.
    */
   hedgeMs?: number | undefined
+  /**
+   * Коллекция голосов (voice-lab-spec §2): `voice: "@<slug>"` → движок, голос и подача по умолчанию
+   * из `envs/voices/<slug>.mdz` (Node — `fileCollection`). Нет — `@…` падает понятной ошибкой.
+   */
+  collection?: VoiceCollection | undefined
   /** Хедж сработал (куда и чем кончился) — в лог сервера. */
   onHedge?: ((e: { key: string; engine: string; winner: 'first' | 'hedge' | 'none'; ms: number }) => void) | undefined
 }
@@ -75,6 +80,31 @@ export interface Speaker {
   stream(texts: readonly string[], req: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array>
 }
 
+/** Голос коллекции — то, что нужно синтезу (остальные поля файла — для стенда). */
+export interface CollectionVoice {
+  slug: string
+  engine: string
+  voice: string
+  /** Подача по умолчанию (`$style`): идёт в `instruct`, если запрос свою не задал. */
+  style?: string | undefined
+}
+
+export interface VoiceCollection {
+  get(slug: string): Promise<CollectionVoice | undefined>
+}
+
+/** `@slug` → запрос с движком и голосом коллекции; остальное — как есть. */
+export async function expandCollection(req: SpeakRequest, collection: VoiceCollection | undefined): Promise<SpeakRequest> {
+  const v = req.voice?.trim()
+  if (!v?.startsWith('@')) return req
+  const slug = v.slice(1)
+  if (!collection) throw new Error(`speak: голос «${v}» — из коллекции, а коллекция не подключена`)
+  const hit = await collection.get(slug)
+  if (!hit) throw new Error(`speak: в коллекции нет голоса «${slug}» (envs/voices/${slug}.mdz)`)
+  const { engine: _engine, ...rest } = req
+  return { ...rest, voice: `${hit.engine}:${hit.voice}`, ...(!req.instruct?.trim() && hit.style ? { instruct: hit.style } : {}) }
+}
+
 const hex = (buf: ArrayBuffer): string => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
 
 export async function sha256(s: string): Promise<string> {
@@ -92,9 +122,13 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     if (!Number.isFinite(s) || s < 0.25 || s > 4) throw new Error(`speak: темп ${req.speed} вне 0.25…4`)
     return s
   }
-  const resolve = (voice?: string, engine?: string): Promise<Resolved> => resolveVoice(o.engines, voice, { engine, defaultVoice: o.defaultVoice })
+  const resolve = async (voice?: string, engine?: string): Promise<Resolved> => {
+    const r = await expandCollection({ voice, engine }, o.collection)
+    return resolveVoice(o.engines, r.voice, { engine: r.engine, defaultVoice: o.defaultVoice })
+  }
 
-  async function key(text: string, req: SpeakRequest, format: Format): Promise<{ key: string; voice: Resolved }> {
+  async function key(text: string, req0: SpeakRequest, format: Format): Promise<{ key: string; voice: Resolved }> {
+    const req = await expandCollection(req0, o.collection)
     const voice = await resolve(req.voice, req.engine)
     return { key: `${await segmentKey(voice.engine, voice.voice, req.instruct?.trim() ?? '', speedOf(req), text)}.${format}`, voice }
   }
@@ -102,8 +136,9 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
   // Один и тот же кусок разом (клиент + предзагрузка) — один синтез.
   const inflight = new Map<string, Promise<SynthResult>>()
 
-  async function synth(text: string, req: SpeakRequest, format: Format, signal?: AbortSignal): Promise<SynthResult> {
+  async function synth(text: string, req0: SpeakRequest, format: Format, signal?: AbortSignal): Promise<SynthResult> {
     if (!text.trim()) throw new Error('speak: пустой текст')
+    const req = await expandCollection(req0, o.collection)
     const { key: k, voice } = await key(text, req, format)
     const running = inflight.get(k)
     if (running) return running
@@ -251,8 +286,9 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     }
   }
 
-  async function* stream(texts: readonly string[], req: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
+  async function* stream(texts: readonly string[], req0: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
     if (!texts.length) throw new Error('speak: пустой текст')
+    const req = await expandCollection(req0, o.collection)
     // wav: один заголовок на поток, куски — сырым PCM.
     const part: Format = format === 'wav' ? 'pcm' : format
     let started = false
