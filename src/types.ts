@@ -67,10 +67,12 @@ export interface SpeakOpts {
 export interface AudioChunk {
   data: Uint8Array
   mime: string
+  /** Звук дал запасной движок (`createFallbackEngine`): под ключом основного не кэшируется. */
+  fallback?: string
 }
 
 export interface TtsEngine {
-  /** Какой движок (`gemini` | `vertex` | `routed` | `chirp` | `edge` | `openai`). */
+  /** Какой движок (`gemini` | `vertex` | `routed` | `chirp` | `edge` | `openai` | `say` | `omnivoice` | `pocket`). */
   readonly kind?: string
   /** Лимит своих голосов у провайдера: 200 у Gemini, 0 у остальных (своих нет). */
   readonly limit?: number

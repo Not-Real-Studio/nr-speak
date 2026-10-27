@@ -3,7 +3,8 @@
  * инъекцией `fetch`, кэш и ffmpeg — инъекцией (Node-реализации — `@notrealstudio/speak/node`).
  *
  *   движки     createVertexEngine · createGeminiEngine (AI Studio) · createRoutedEngine ·
- *              createChirpEngine · createEdgeEngine · createOpenAIEngine — всё за TtsEngine
+ *              createChirpEngine · createEdgeEngine · createOpenAIEngine · createLocalEngine
+ *              (OmniVoice, pocket) · createFallbackEngine — всё за TtsEngine
  *   голоса     catalog · resolveVoice (`vertex:Kore`, короткое имя: Vertex → Studio → Chirp → Edge)
  *   текст      l0Markdown · l0Text (нормализатор L0) → segment / segmentText (куски)
  *   речь→текст createGeminiTranscriber (Gemini 3.5 Transcribe) · segmentsOf · sniffAudio
@@ -15,6 +16,7 @@ export * from './gemini.js'
 export * from './chirp.js'
 export * from './edge.js'
 export * from './openai.js'
+export * from './local.js'
 export * from './catalog.js'
 export * from './segment.js'
 export * from './normalize.js'

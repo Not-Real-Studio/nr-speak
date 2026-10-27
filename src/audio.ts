@@ -45,12 +45,14 @@ export function concat(parts: readonly Uint8Array[]): Uint8Array {
 export async function collect(chunks: AsyncIterable<AudioChunk>): Promise<AudioChunk> {
   const parts: Uint8Array[] = []
   let mime = ''
+  let fallback: string | undefined
   for await (const c of chunks) {
     mime ||= c.mime
+    fallback ??= c.fallback
     parts.push(c.data)
   }
   if (!parts.length) throw new Error('speak: провайдер не прислал звука')
-  return { data: concat(parts), mime }
+  return { data: concat(parts), mime, ...(fallback ? { fallback } : {}) }
 }
 
 /**

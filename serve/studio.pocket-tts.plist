@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- m2 (DEV-520): PocketTTS-RU Shtorm на CPU, :8096. Ставится в ~/Library/LaunchAgents, venv ~/nr/tts/venv. -->
+<plist version="1.0"><dict>
+<key>Label</key><string>studio.pocket-tts</string>
+<key>ProgramArguments</key><array>
+<string>/Users/lenapavlushina/nr/tts/venv/bin/python</string><string>/Users/lenapavlushina/nr/tts/local_tts.py</string>
+<string>--engine=pocket</string><string>--port=8096</string><string>--host=0.0.0.0</string><string>--data=/Users/lenapavlushina/nr/tts/data</string>
+<string>--default-voice=denis-11s</string>
+</array>
+<key>EnvironmentVariables</key><dict><key>HF_HOME</key><string>/Users/lenapavlushina/nr/tts/hf</string><key>PATH</key><string>/Users/lenapavlushina/nr/bin:/usr/bin:/bin</string><key>PYTHONUNBUFFERED</key><string>1</string></dict>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>/Users/lenapavlushina/nr/logs/pocket-tts.log</string><key>StandardErrorPath</key><string>/Users/lenapavlushina/nr/logs/pocket-tts.log</string>
+</dict></plist>

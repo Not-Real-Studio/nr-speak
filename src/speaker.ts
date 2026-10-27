@@ -176,7 +176,8 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
       )
     const audio = await hedged(once, o.hedgeMs ?? 8000, signal, (winner, ms) => o.onHedge?.({ key: k, engine: voice.engine, winner, ms }))
     const data = await convert(audio, format, { speed: engine.nativeSpeed ? 1 : speed, ffmpeg: o.ffmpeg })
-    await o.cache?.set(k, data)
+    // Звук запасного движка — не под ключом основного (DEV-520).
+    if (!audio.fallback) await o.cache?.set(k, data)
     return { data, contentType, cached: false, key: k, voice }
   }
 
@@ -271,7 +272,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
       if (signal?.aborted) throw new Error('speak: синтез отменён')
       const data = concat(parts)
       complete = true
-      await o.cache?.set(k, data)
+      if (!first.value.fallback) await o.cache?.set(k, data)
       settle({ data, contentType: CONTENT_TYPE[format], cached: false, key: k, voice })
     } catch (err) {
       fail(err)

@@ -16,6 +16,8 @@ import type { EdgeClient } from '../edge.js'
 import { createEdgeEngine } from '../edge.js'
 import { createOpenAIEngine } from '../openai.js'
 import { createSayEngine, hasSay } from './say.js'
+import { createFallbackEngine, createLocalEngine } from '../local.js'
+import { fileSampleLoader } from './sample.js'
 
 /** Структурно — `IContext` runz: сервису нужен только `get`. */
 interface Ctx {
@@ -170,6 +172,8 @@ export interface EnginesFromCtxOpts {
   edge?: EdgeClient | undefined
   /** Кэш библиотеки готовых голосов AI Studio (`fileLibraryCache`). */
   libraryCache?: LibraryCache | undefined
+  /** Переход OmniVoice → pocket (в лог сервиса). */
+  onFallback?: ((e: { reason: string; skipped: boolean }) => void) | undefined
 }
 
 /**
@@ -210,6 +214,26 @@ export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
   if (on('say') && hasSay()) {
     const sv = str(speakOpt(ctx, 'say_voice'))
     out.say = createSayEngine(sv ? { defaultVoice: sv } : {})
+  }
+  // Свои серверы речи (DEV-520, `serve/local_tts.py`): `$omnivoice_url` (лаптоп), `$pocket_url` (m2).
+  // Оба есть — omnivoice с автопереходом на pocket: нет первого звука за `$omnivoice_first_ms`
+  // (2000) или ошибка — фраза уходит pocket, лаптоп пропускается `$omnivoice_cooldown_ms` (60 000).
+  const loadSample = fileSampleLoader()
+  const local = (kind: 'omnivoice' | 'pocket') => {
+    const url = str(speakOpt(ctx, `${kind}_url`))
+    return on(kind) && url ? createLocalEngine({ kind, baseUrl: url, loadSample, ...common }) : undefined
+  }
+  const pocket = local('pocket')
+  const omni = local('omnivoice')
+  if (pocket) out.pocket = pocket
+  if (omni) {
+    const num = (k: string): number | undefined => {
+      const v = Number(speakOpt(ctx, k))
+      return Number.isFinite(v) && v > 0 ? v : undefined
+    }
+    const firstAudioMs = num('omnivoice_first_ms')
+    const cooldownMs = num('omnivoice_cooldown_ms')
+    out.omnivoice = pocket && str(speakOpt(ctx, 'omnivoice_fallback')) !== 'off' ? createFallbackEngine(omni, pocket, { ...(firstAudioMs ? { firstAudioMs } : {}), ...(cooldownMs ? { cooldownMs } : {}), ...(o.onFallback ? { onFallback: o.onFallback } : {}) }) : omni
   }
   return out
 }

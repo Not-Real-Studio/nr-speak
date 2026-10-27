@@ -58,6 +58,18 @@ const one = await speaker.synth('Привет', { voice: 'chirp:Aoede', speed: 1
 его сам на darwin (`$engines` — выключить). Звук — WAV, темп — перекодировщиком. Piper — следующий
 кандидат тем же контрактом (звучит лучше, но ставится отдельно).
 
+**Свои серверы речи (DEV-520).** `omnivoice` (лаптоп, GPU) и `pocket` (m2, CPU) — сервер
+`serve/local_tts.py` (`--engine omnivoice|pocket`; plist m2 — `serve/studio.pocket-tts.plist`,
+лаптоп — `serve/omnivoice-serve.cmd` задачей при входе), поток PCM 24 кГц по предложениям.
+`createLocalEngine({kind, baseUrl, loadSample})`; голос — путь к образцу (`omnivoice:~/…/denis-11s.wav`,
+текст образца — соседний `.txt`; образец уходит на сервер один раз `PUT /v1/voices/<хэш>`, сервер
+держит промпт в памяти), `design:<атрибуты>` (OmniVoice; у pocket — его голос по умолчанию), пусто —
+голос сервера по умолчанию. Конфиг — `$omnivoice_url`, `$pocket_url` блока `## $speak`; оба есть —
+`omnivoice` с автопереходом (`createFallbackEngine`): нет первого звука за `$omnivoice_first_ms`
+(2000) или ошибка до первого звука — фраза уходит `pocket`, лаптоп пропускается
+`$omnivoice_cooldown_ms` (60 000); `$omnivoice_fallback: off` — без перехода. Звук запасного
+помечен `fallback` и в кэш кусков не ложится.
+
 **Нормализатор L0.** `l0Markdown(md, opts)` / `l0Text(text, opts)` → `{title, blocks: [{kind, text}]}`;
 `blocksText(blocks)` — текст для глаз (`--print`). Выкидывает frontmatter, картинки, адреса
 ссылок, голые URL, сноски, HTML и мусор-токены (`stripTokens`, всегда): hex от 7 символов с

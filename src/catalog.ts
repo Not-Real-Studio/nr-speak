@@ -1,7 +1,8 @@
 /**
  * Каталог голосов всех настроенных движков и резолв имён. Полное имя — с префиксом
  * движка: `vertex:Kore`, `studio:voice_…`, `chirp:ru-RU-Chirp3-HD-Aoede`,
- * `edge:ru-RU-SvetlanaNeural`, `openai:<голос>`, `say:Milena` (macOS, без сети). Короткое имя ищется по порядку
+ * `edge:ru-RU-SvetlanaNeural`, `openai:<голос>`, `say:Milena` (macOS, без сети), `omnivoice:<образец>` и
+ * `pocket:<образец>` (свои серверы, DEV-520). Короткое имя ищется по порядку
  * Vertex → Studio → Chirp → Edge → OpenAI: точное совпадение id (без регистра), затем
  * однозначное совпадение части id (`Svetlana` → `ru-RU-SvetlanaNeural`, `Aoede` в Chirp —
  * только с префиксом, иначе это студийный голос Vertex).
@@ -10,11 +11,11 @@
 import { STUDIO_VOICES, VERTEX_NO_LIBRARY, studioVoice } from './gemini.js'
 import type { TtsEngine, VoiceInfo } from './types.js'
 
-export const ENGINE_NAMES = ['vertex', 'studio', 'chirp', 'edge', 'openai', 'say'] as const
+export const ENGINE_NAMES = ['vertex', 'studio', 'chirp', 'edge', 'openai', 'say', 'omnivoice', 'pocket'] as const
 export type EngineName = (typeof ENGINE_NAMES)[number]
 export type Tier = 'free' | 'cheap' | 'premium' | 'local'
 
-export const ENGINE_TIER: Record<EngineName, Tier> = { vertex: 'premium', studio: 'cheap', chirp: 'free', edge: 'free', openai: 'local', say: 'local' }
+export const ENGINE_TIER: Record<EngineName, Tier> = { vertex: 'premium', studio: 'cheap', chirp: 'free', edge: 'free', openai: 'local', say: 'local', omnivoice: 'local', pocket: 'local' }
 
 /** Настроенные движки по имени; отсутствующий — не настроен. */
 export type Engines = Partial<Record<EngineName, TtsEngine>>
@@ -110,8 +111,8 @@ async function within(engines: Engines, n: EngineName, voice: string): Promise<R
     const hit = matchLibrary(await e.library(), voice)
     return { engine: n, voice: hit?.id ?? voice }
   }
-  // OpenAI — как есть: его список не обязан быть полным.
-  if (n === 'openai') return { engine: n, voice }
+  // OpenAI и локальные — как есть: список не обязан быть полным (у локальных голос — путь к образцу или `design:`).
+  if (n === 'openai' || n === 'omnivoice' || n === 'pocket') return { engine: n, voice }
   const ids = await idsOf(n, e)
   const hit = matchVoice(ids, voice)
   if (!hit && n === 'vertex' && /^[a-z]{2,3}-[a-z0-9]+-/.test(voice)) throw new Error(`speak: ${VERTEX_NO_LIBRARY(voice)}`)
