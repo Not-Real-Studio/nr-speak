@@ -186,6 +186,9 @@ class Voices:
         return t.read_text("utf-8").strip() if t.exists() else ""
 
     def put(self, vid, audio, text):
+        # id — хэш звука и текста у клиента: тот же образец повторно не перечитываем и не готовим.
+        if (self.dir / f"{vid}.wav").exists() and self.text_of(vid) == (text or "").strip():
+            return self.get(vid)
         a, rate = sf.read(io.BytesIO(audio), dtype="float32", always_2d=True)
         if a.shape[0] < rate:
             raise ValueError("образец короче секунды")
@@ -240,7 +243,7 @@ def main():
     log(f"{engine.name}: модель {engine.model_id} на {engine.device} за {time.time() - t0:.1f} с")
 
     def resolve(vid):
-        vid = (vid or "").strip() or (args.default_voice or "")
+        vid = (vid or "").strip() or (args.default_voice if args.default_voice in voices.ids() else "")
         if not vid:
             return None
         if vid.startswith("design:"):
@@ -263,10 +266,13 @@ def main():
                 state["busy"] = False
 
     # Прогрев: первая фраза после старта не платит за компиляцию ядер и кэш.
-    for vid in [args.default_voice] if args.default_voice else voices.ids()[:1] or [None]:
+    warm = args.default_voice if args.default_voice in voices.ids() else (voices.ids()[:1] or [None])[0]
+    if engine.name == "pocket" and warm is None:
+        log("прогрев пропущен: у pocket нет образца")
+    for vid in [warm] if engine.name != "pocket" or warm else []:
         try:
             t1 = time.time()
-            n = sum(len(b) for b in synth(args.warmup, resolve(vid), None))
+            n = sum(len(b) for b in synth(args.warmup, resolve(vid) if vid else None, None))
             log(f"прогрев ({vid or 'дизайн'}): {n / 2 / OUT_RATE:.2f} с звука за {time.time() - t1:.2f} с")
         except Exception as e:  # noqa: BLE001
             log("прогрев не удался:", e)
@@ -364,7 +370,7 @@ def main():
                         chunk(pcm)
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 it.close()
                 log("клиент ушёл посреди синтеза")
                 return

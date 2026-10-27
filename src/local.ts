@@ -172,9 +172,9 @@ function join(a: Uint8Array, b: Uint8Array): Uint8Array {
 }
 
 export interface FallbackOpts {
-  /** Нет первого звука за столько мс — запасной (по умолчанию 2000). */
+  /** Нет первого звука за столько мс — запасной (по умолчанию 1500: цель «Разговора» — первый звук ≤ 1 с). */
   firstAudioMs?: number | undefined
-  /** После сбоя основной пропускается столько мс (по умолчанию 60 000). */
+  /** После сбоя основной пропускается столько мс (по умолчанию 300 000: перегретый лаптоп не остывает за минуту). */
   cooldownMs?: number | undefined
   /** Имя запасного в пометке `fallback` (по умолчанию его `kind`). */
   backupName?: string | undefined
@@ -187,8 +187,8 @@ export interface FallbackOpts {
  * основной договаривает сам (обрыв посреди — ошибка, как у любого движка).
  */
 export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: FallbackOpts = {}): TtsEngine {
-  const firstMs = o.firstAudioMs ?? 2000
-  const cooldown = o.cooldownMs ?? 60_000
+  const firstMs = o.firstAudioMs ?? 1500
+  const cooldown = o.cooldownMs ?? 300_000
   const now = o.now ?? Date.now
   const name = o.backupName ?? backup.kind ?? 'backup'
   let downUntil = 0

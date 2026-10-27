@@ -217,7 +217,7 @@ export function enginesFromCtx(ctx: unknown, o: EnginesFromCtxOpts): Engines {
   }
   // Свои серверы речи (DEV-520, `serve/local_tts.py`): `$omnivoice_url` (лаптоп), `$pocket_url` (m2).
   // Оба есть — omnivoice с автопереходом на pocket: нет первого звука за `$omnivoice_first_ms`
-  // (2000) или ошибка — фраза уходит pocket, лаптоп пропускается `$omnivoice_cooldown_ms` (60 000).
+  // (1500) или ошибка — фраза уходит pocket, лаптоп пропускается `$omnivoice_cooldown_ms` (300 000).
   const loadSample = fileSampleLoader()
   const local = (kind: 'omnivoice' | 'pocket') => {
     const url = str(speakOpt(ctx, `${kind}_url`))

@@ -66,8 +66,8 @@ const one = await speaker.synth('Привет', { voice: 'chirp:Aoede', speed: 1
 держит промпт в памяти), `design:<атрибуты>` (OmniVoice; у pocket — его голос по умолчанию), пусто —
 голос сервера по умолчанию. Конфиг — `$omnivoice_url`, `$pocket_url` блока `## $speak`; оба есть —
 `omnivoice` с автопереходом (`createFallbackEngine`): нет первого звука за `$omnivoice_first_ms`
-(2000) или ошибка до первого звука — фраза уходит `pocket`, лаптоп пропускается
-`$omnivoice_cooldown_ms` (60 000); `$omnivoice_fallback: off` — без перехода. Звук запасного
+(1500) или ошибка до первого звука — фраза уходит `pocket`, лаптоп пропускается
+`$omnivoice_cooldown_ms` (300 000); `$omnivoice_fallback: off` — без перехода. Звук запасного
 помечен `fallback` и в кэш кусков не ложится.
 
 **Нормализатор L0.** `l0Markdown(md, opts)` / `l0Text(text, opts)` → `{title, blocks: [{kind, text}]}`;
