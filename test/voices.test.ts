@@ -172,6 +172,16 @@ $tags: $[narrator, low]
     await expect(bare.resolve('@podcaster-1')).rejects.toThrow(/коллекция не подключена/)
   })
 
+  it('Speaker: голос по умолчанию @slug — из коллекции, явный голос и движок запроса главнее (DEV-520)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'speak-col-'))
+    writeFileSync(join(dir, 'podcaster-1.mdz'), PODCASTER)
+    const studio = mockEngine({ kind: 'gemini' })
+    const speaker = createSpeaker({ engines: { studio: studio.engine }, collection: fileCollection(dir), defaultVoice: '@podcaster-1' })
+    expect(await speaker.resolve()).toEqual({ engine: 'studio', voice: 'en-us-podcaster-1' })
+    expect(await speaker.resolve('')).toEqual({ engine: 'studio', voice: 'en-us-podcaster-1' })
+    expect(await speaker.resolve('studio:other')).toEqual({ engine: 'studio', voice: 'other' })
+  })
+
   it('save / update / remove: комментарии живут, занятый слаг — с номером', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'speak-col-'))
     writeFileSync(join(dir, 'podcaster-1.mdz'), PODCASTER)

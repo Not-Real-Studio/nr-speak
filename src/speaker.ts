@@ -123,7 +123,9 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     return s
   }
   const resolve = async (voice?: string, engine?: string): Promise<Resolved> => {
-    const r = await expandCollection({ voice, engine }, o.collection)
+    // Голос по умолчанию из коллекции (`$voice: @slug`, DEV-520) разворачивается так же, как голос запроса.
+    const own = voice?.trim() || (!engine && o.defaultVoice?.trim().startsWith('@') ? o.defaultVoice.trim() : undefined)
+    const r = await expandCollection({ voice: own, engine }, o.collection)
     return resolveVoice(o.engines, r.voice, { engine: r.engine, defaultVoice: o.defaultVoice })
   }
 

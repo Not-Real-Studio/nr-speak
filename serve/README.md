@@ -33,3 +33,14 @@
 Грабли: `ProcessType Background` в plist на m2 сажает процесс на E-ядра — RTF 1.0 вместо 0.17;
 RUAccent (DEV-517) на свежих transformers падает (`token_type_ids`) и держит 3+ ГБ — заменён
 silero-stress; односложным словам ударение снимается.
+
+## Включено 28.10.2026
+
+`~/.runz/config.md` на m4, блок `## $speak` (копия до правки — `/tmp/runz-config.bak-1754`): `$omnivoice_url`,
+`$pocket_url` и голос по умолчанию `$voice: omnivoice:~/Studio/data/voice-lab/local/samples/denis-11s.wav`
+(клон Denis, omnivoice → pocket), было `openai:vertex:Sulafat`; Google — выбором голоса. `studio.speak`
+перезапущен (до этого жил с 22.10, без DEV-513/520). После слияния правки speaker.ts можно писать `$voice: @denis-local`.
+
+Через speak на m4 (mp3, первый байт): первая фраза 2.1 с (лаптоп в тротлинге, переход на pocket по порогу 1.5 с),
+следующие 0.20–0.21 с (лаптоп в паузе 5 мин, сразу pocket), `@denis-pocket` 0.12 с, `openai:vertex:Sulafat` 3.7 с.
+e2e-live `acceptance-voice-rp` (VRP-1, «Разговор» в RP) на lab — passed.
