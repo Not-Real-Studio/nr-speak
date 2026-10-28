@@ -30,11 +30,13 @@ export interface CollectionEntry extends CollectionVoice {
   tags?: string[]
   note?: string
   tried?: string
+  /** Запасные голоса (`$fallback: openai:vertex:Sulafat, say:Milena`, DEV-547). */
+  fallback?: string[]
   /** Прочие поля файла как есть. */
   extra: Record<string, string | string[]>
 }
 
-const KNOWN = ['name', 'description', 'engine', 'voice', 'type', 'lang', 'gender', 'pitch', 'design', 'source', 'consent', 'raw', 'sample', 'tags', 'note', 'tried', 'style'] as const
+const KNOWN = ['name', 'description', 'engine', 'voice', 'type', 'lang', 'gender', 'pitch', 'design', 'source', 'consent', 'raw', 'sample', 'tags', 'note', 'tried', 'style', 'fallback'] as const
 
 /** Плоский mdz голоса: `$ключ: значение`, `$[a, b]` — список, `$//` — комментарий. */
 export function parseVoiceMdz(src: string): Record<string, string | string[]> {
@@ -67,7 +69,7 @@ export function entryOf(slug: string, src: string): CollectionEntry | undefined 
     if (k === 'engine' || k === 'voice') continue
     const v = raw[k]
     if (v === undefined) continue
-    if (k === 'tags') e.tags = Array.isArray(v) ? v : v.split(',').map((x) => x.trim()).filter(Boolean)
+    if (k === 'tags' || k === 'fallback') e[k] = Array.isArray(v) ? v : v.split(/[,→]/).map((x) => x.trim()).filter(Boolean)
     else (e as unknown as Record<string, string>)[k] = one(v)!
   }
   for (const [k, v] of Object.entries(raw)) if (!(KNOWN as readonly string[]).includes(k)) e.extra[k] = v
@@ -97,6 +99,7 @@ export function voiceMdz(e: Omit<CollectionEntry, 'slug' | 'extra'> & { extra?: 
   put('consent', e.consent)
   put('raw', e.raw)
   put('sample', e.sample)
+  put('fallback', e.fallback)
   put('style', e.style)
   put('tags', e.tags)
   put('note', e.note)

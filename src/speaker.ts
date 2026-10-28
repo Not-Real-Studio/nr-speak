@@ -12,8 +12,9 @@ import type { CatalogVoice, EngineName, Engines, Resolved } from './catalog.js'
 import { catalog, resolveVoice } from './catalog.js'
 import type { FfmpegPipe, FfmpegRun, Format } from './audio.js'
 import { collect, concat, CONTENT_TYPE, convert, ffmpegArgs, OUT_RATE, wavHeader } from './audio.js'
-import type { AudioChunk } from './types.js'
+import type { AudioChunk, SpeakOpts, TtsEngine } from './types.js'
 import { isMp3, isPcm, rateOf } from './types.js'
+import { createFallbackEngine } from './local.js'
 
 export interface SegmentCache {
   get(key: string): Promise<Uint8Array | undefined>
@@ -27,6 +28,12 @@ export interface SpeakRequest {
   engine?: string | undefined
   instruct?: string | undefined
   speed?: number | undefined
+  /**
+   * Запасные голоса по порядку (`$fallback` голоса коллекции, DEV-547): основной не дал первого
+   * звука за `chainFirstAudioMs` (или упал) — та же фраза следующим. Звук запасного не кэшируется
+   * под ключом основного.
+   */
+  fallback?: readonly string[] | undefined
 }
 
 export interface SynthResult {
@@ -59,6 +66,12 @@ export interface SpeakerOpts {
    * из `envs/voices/<slug>.mdz` (Node — `fileCollection`). Нет — `@…` падает понятной ошибкой.
    */
   collection?: VoiceCollection | undefined
+  /** Цепочка `fallback`: первый звук основного — за столько мс, иначе следующий голос (по умолчанию 1500). */
+  chainFirstAudioMs?: number | undefined
+  /** То же для второго и дальше звена (облако думает дольше локального; по умолчанию 20 000 — переход по ошибке). */
+  chainNextAudioMs?: number | undefined
+  /** Цепочка перешла на запасной голос — в лог сервера. */
+  onChainFallback?: ((e: { voice: string; reason: string }) => void) | undefined
   /** Хедж сработал (куда и чем кончился) — в лог сервера. */
   onHedge?: ((e: { key: string; engine: string; winner: 'first' | 'hedge' | 'none'; ms: number }) => void) | undefined
 }
@@ -87,6 +100,8 @@ export interface CollectionVoice {
   voice: string
   /** Подача по умолчанию (`$style`): идёт в `instruct`, если запрос свою не задал. */
   style?: string | undefined
+  /** Запасные голоса по порядку (`$fallback`, DEV-547): `openai:vertex:Sulafat, say:Milena`. */
+  fallback?: readonly string[] | undefined
 }
 
 export interface VoiceCollection {
@@ -102,7 +117,24 @@ export async function expandCollection(req: SpeakRequest, collection: VoiceColle
   const hit = await collection.get(slug)
   if (!hit) throw new Error(`speak: в коллекции нет голоса «${slug}» (envs/voices/${slug}.mdz)`)
   const { engine: _engine, ...rest } = req
-  return { ...rest, voice: `${hit.engine}:${hit.voice}`, ...(!req.instruct?.trim() && hit.style ? { instruct: hit.style } : {}) }
+  return {
+    ...rest,
+    voice: `${hit.engine}:${hit.voice}`,
+    ...(!req.instruct?.trim() && hit.style ? { instruct: hit.style } : {}),
+    ...(!req.fallback?.length && hit.fallback?.length ? { fallback: hit.fallback } : {}),
+  }
+}
+
+/** Движок с прибитым голосом: цепочка зовёт звенья одним `speak`, а голоса у них разные. */
+function pinned(engine: TtsEngine, voice: string, kind: string): TtsEngine {
+  return {
+    kind,
+    limit: engine.limit ?? 0,
+    ...(engine.nativeSpeed ? { nativeSpeed: true } : {}),
+    voices: (opts) => engine.voices(opts),
+    design: (spec) => engine.design(spec),
+    speak: (text: string, _voice: string, opts: SpeakOpts, signal?: AbortSignal) => engine.speak(text, voice, opts, signal),
+  }
 }
 
 const hex = (buf: ArrayBuffer): string => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -128,6 +160,43 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     const r = await expandCollection({ voice: own, engine }, o.collection)
     return resolveVoice(o.engines, r.voice, { engine: r.engine, defaultVoice: o.defaultVoice })
   }
+
+  // Цепочки голосов (`fallback`) — по одной на набор: в звене живёт пропуск упавшего (`cooldownMs`).
+  const chains = new Map<string, Promise<TtsEngine>>()
+  const chainOf = (voice: Resolved, fallback: readonly string[]): Promise<TtsEngine> => {
+    const id = [`${voice.engine}:${voice.voice}`, ...fallback].join('|')
+    let p = chains.get(id)
+    if (!p) {
+      p = (async () => {
+        const links: { engine: TtsEngine; name: string }[] = [{ engine: pinned(o.engines[voice.engine]!, voice.voice, voice.engine), name: `${voice.engine}:${voice.voice}` }]
+        for (const v of fallback) {
+          try {
+            const r = await resolve(v)
+            const name = `${r.engine}:${r.voice}`
+            if (links.some((l) => l.name === name)) continue
+            links.push({ engine: pinned(o.engines[r.engine]!, r.voice, r.engine), name })
+          } catch {
+            // Запасной не настроен на этом сервере (нет движка) — звено пропускается.
+          }
+        }
+        let acc = links[links.length - 1]!.engine
+        for (let i = links.length - 2; i >= 0; i--) {
+          const backup = links[i + 1]!.name
+          acc = createFallbackEngine(links[i]!.engine, acc, {
+            firstAudioMs: i === 0 ? (o.chainFirstAudioMs ?? 1500) : (o.chainNextAudioMs ?? 20_000),
+            backupName: backup,
+            onFallback: (e) => o.onChainFallback?.({ voice: backup, reason: e.reason }),
+          })
+        }
+        return acc
+      })()
+      p.catch(() => chains.delete(id))
+      chains.set(id, p)
+    }
+    return p
+  }
+  const engineFor = (voice: Resolved, req: SpeakRequest): Promise<TtsEngine> | TtsEngine =>
+    req.fallback?.length ? chainOf(voice, req.fallback) : o.engines[voice.engine]!
 
   async function key(text: string, req0: SpeakRequest, format: Format): Promise<{ key: string; voice: Resolved }> {
     const req = await expandCollection(req0, o.collection)
@@ -160,7 +229,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
       stats.hits++
       return { data: hit, contentType, cached: true, key: k, voice }
     }
-    const engine = o.engines[voice.engine]!
+    const engine = await engineFor(voice, req)
     const speed = speedOf(req)
     stats.synth++
     const once = (sig?: AbortSignal) =>
@@ -199,7 +268,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
       onFirst()
       return yield hit
     }
-    const engine = o.engines[voice.engine]!
+    const engine = await engineFor(voice, req)
     const speed = speedOf(req)
     const tempo = engine.nativeSpeed ? 1 : speed
     stats.synth++

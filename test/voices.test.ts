@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { cleanWav, createGeminiEngine, createRoutedEngine, createSpeaker, createVertexEngine, filterLibrary, matchLibrary, resolveVoice, voiceConfig, wavHeader } from '../src/index.js'
 import { entryOf, fileCollection, fileLibraryCache, slugOf } from '../src/node/index.js'
+import type { SegmentCache, TtsEngine } from '../src/index.js'
 import { json, mockEngine } from './helpers.js'
 
 const LIB = [
@@ -180,6 +181,46 @@ $tags: $[narrator, low]
     expect(await speaker.resolve()).toEqual({ engine: 'studio', voice: 'en-us-podcaster-1' })
     expect(await speaker.resolve('')).toEqual({ engine: 'studio', voice: 'en-us-podcaster-1' })
     expect(await speaker.resolve('studio:other')).toEqual({ engine: 'studio', voice: 'other' })
+  })
+
+  it('Speaker: $fallback голоса коллекции — локальный упал → облако, облако упало → say; звук запасного не в кэш (DEV-547)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'speak-col-'))
+    writeFileSync(join(dir, 'sula.mdz'), '$name: Sula\n$engine: pocket\n$voice: ~/s.wav\n$fallback: openai:vertex:Sulafat, say:Milena\n')
+    expect((await fileCollection(dir).get('sula'))?.fallback).toEqual(['openai:vertex:Sulafat', 'say:Milena'])
+    const pocket = mockEngine({ kind: 'pocket', fail: new Error('m2 спит') })
+    const openai = mockEngine({ kind: 'openai' })
+    const say = mockEngine({ kind: 'say', voices: ['Milena'] })
+    const stored: string[] = []
+    const cache: SegmentCache = { get: async () => undefined, set: async (k) => void stored.push(k) }
+    const speaker = createSpeaker({ engines: { pocket: pocket.engine, openai: openai.engine, say: say.engine }, collection: fileCollection(dir), cache })
+    const r = await speaker.synth('Привет', { voice: '@sula' }, 'pcm')
+    expect(new TextDecoder().decode(r.data)).toBe('[vertex:Sulafat:Привет]')
+    expect(pocket.calls.map((c) => c.voice)).toEqual(['~/s.wav'])
+    expect(stored).toEqual([])
+    // Без цепочки голос — как был: ошибка движка наружу.
+    await expect(speaker.synth('Привет', { voice: 'pocket:~/s.wav' }, 'pcm')).rejects.toThrow(/m2 спит/)
+  })
+
+  it('Speaker: $fallback — основной молчит дольше порога → следующий голос', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'speak-col-'))
+    writeFileSync(join(dir, 'sula.mdz'), '$name: Sula\n$engine: pocket\n$voice: s\n$fallback: $[say:Milena]\n')
+    const slow: TtsEngine = {
+      kind: 'pocket',
+      limit: 0,
+      voices: async () => [],
+      design: async () => {
+        throw new Error('нет')
+      },
+      async *speak(_t, _v, _o, signal) {
+        await new Promise((res) => setTimeout(res, 200))
+        if (signal?.aborted) return
+        yield { data: new Uint8Array([1]), mime: 'audio/l16; rate=24000; channels=1' }
+      },
+    }
+    const say = mockEngine({ kind: 'say', voices: ['Milena'] })
+    const speaker = createSpeaker({ engines: { pocket: slow, say: say.engine }, collection: fileCollection(dir), chainFirstAudioMs: 30 })
+    const r = await speaker.synth('Раз', { voice: '@sula' }, 'pcm')
+    expect(new TextDecoder().decode(r.data)).toBe('[Milena:Раз]')
   })
 
   it('save / update / remove: комментарии живут, занятый слаг — с номером', async () => {
