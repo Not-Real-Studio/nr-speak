@@ -58,3 +58,14 @@ describe('каталог', () => {
     expect((await catalog(e, { engine: 'edge' })).voices.map((v) => v.id)).toEqual(['edge:ru-RU-DmitryNeural', 'edge:ru-RU-SvetlanaNeural'])
   })
 })
+
+describe('say без macOS', () => {
+  it('`say:Milena` на сервере без say → Edge', async () => {
+    const engine = { voices: async () => [], synthesize: async () => new Uint8Array() }
+    assert_say(await resolveVoice({ edge: engine } as never, 'say:Milena'))
+  })
+})
+
+function assert_say(r: { engine: string; voice: string }): void {
+  expect(r).toEqual({ engine: 'edge', voice: 'ru-RU-SvetlanaNeural' })
+}

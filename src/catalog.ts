@@ -43,6 +43,7 @@ export interface Resolved {
 export const isEngineName = (s: string): s is EngineName => (ENGINE_NAMES as readonly string[]).includes(s)
 
 /** Узнаётся по виду без сети: так короткое имя не дёргает каталоги лишний раз. */
+const SAY_SUBSTITUTE = 'ru-RU-SvetlanaNeural'
 const SHAPE: Partial<Record<EngineName, RegExp>> = { studio: /^voice_/, chirp: /Chirp3-HD/i, edge: /Neural$/i }
 
 const tokens = (id: string): string[] => id.toLowerCase().replace(/neural$/, '').split(/[-_\s]+/).filter(Boolean)
@@ -103,6 +104,8 @@ export async function resolveVoice(engines: Engines, name: string | undefined, o
 
 async function within(engines: Engines, n: EngineName, voice: string): Promise<Resolved> {
   const e = engines[n]
+  // `say` есть только на macOS: на Linux последний запасной голос цепочки — Edge, тоже бесплатный.
+  if (!e && n === 'say' && engines.edge) return { engine: 'edge', voice: SAY_SUBSTITUTE }
   if (!e) throw new Error(`speak: движок «${n}» не настроен (есть: ${configured(engines)})`)
   if (!voice) return { engine: n, voice: '' }
   // Studio: свой `voice_…` и студийный — как есть; иначе — библиотека (id или имя), не нашлось — как есть.
