@@ -53,7 +53,7 @@ export interface VertexOpts extends RetryOpts {
   model?: string | undefined
   /** Студийный голос для `voice: ''`. */
   defaultVoice?: string | undefined
-  /** Сколько ждать первый звук основной модели до перехода на lite, мс. */
+  /** Сколько ждать первый звук до перехода на запасную модель, мс. */
   liteFirstMs?: number | undefined
   /** Свежий OAuth-токен (у сервиса — `gcloud auth application-default print-access-token`). */
   token: () => Promise<string>
@@ -68,9 +68,9 @@ export const GEMINI_TTS_MODEL = 'gemini-3.8-flash-lite-tts'
 export const GEMINI_DEFAULT_VOICE = 'Charon'
 export const GEMINI_VOICE_LIMIT = 200
 export const VERTEX_TTS_MODEL = 'gemini-3.8-flash-tts'
-/** Запасная модель Vertex: на замере 30.10 первый байт 0.5 с и ни одного 429 (DEV-569). */
+/** Основная модель Vertex: на замере 30.10 первый байт 0.5 с и ни одного 429 (DEV-569). */
 export const VERTEX_LITE_TTS_MODEL = 'gemini-3.8-flash-lite-tts'
-/** Сколько ждать первый звук основной модели Vertex, мс. */
+/** Сколько ждать первый звук до перехода на запасную модель Vertex, мс. */
 export const VERTEX_LITE_FIRST_MS = 3000
 export const VERTEX_DEFAULT_VOICE = 'Kore'
 export const VERTEX_LOCATION = 'global'
@@ -516,14 +516,15 @@ export function vertexRoot(location: string): string {
  */
 export function createVertexEngine(o: VertexOpts): TtsEngine {
   const location = o.location || VERTEX_LOCATION
-  const model = o.model || VERTEX_TTS_MODEL
+  const model = o.model || VERTEX_LITE_TTS_MODEL
   const http = o.fetch ?? fetch
   const ttl = o.tokenTtl ?? 50 * 60_000
   const now = o.now ?? Date.now
   const modelUrl = (m: string): string =>
     `${o.baseUrl ? geminiRoot(o.baseUrl) : vertexRoot(location)}/v1/projects/${encodeURIComponent(o.project)}/locations/${encodeURIComponent(location)}/publishers/google/models/${m}:streamGenerateContent?alt=sse`
   const url = modelUrl(model)
-  const lite = model === VERTEX_TTS_MODEL ? { url: modelUrl(VERTEX_LITE_TTS_MODEL), model: VERTEX_LITE_TTS_MODEL, firstMs: o.liteFirstMs ?? VERTEX_LITE_FIRST_MS } : undefined
+  const spare = model === VERTEX_LITE_TTS_MODEL ? VERTEX_TTS_MODEL : model === VERTEX_TTS_MODEL ? VERTEX_LITE_TTS_MODEL : undefined
+  const lite = spare ? { url: modelUrl(spare), model: spare, firstMs: o.liteFirstMs ?? VERTEX_LITE_FIRST_MS } : undefined
   const token = vertexToken(o.token, ttl, now)
 
   return {

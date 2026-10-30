@@ -12,7 +12,7 @@ function engine(main: (signal?: AbortSignal | null) => Promise<Response>) {
     calls.push(String(url).includes('flash-lite-tts') ? 'lite' : 'main')
     return String(url).includes('flash-lite-tts') ? sse() : main(init?.signal)
   }) as typeof globalThis.fetch
-  return { calls, e: createVertexEngine({ project: 'p', token: async () => 't', fetch, liteFirstMs: 30 }) }
+  return { calls, e: createVertexEngine({ project: 'p', token: async () => 't', fetch, model: 'gemini-3.8-flash-tts', liteFirstMs: 30 }) }
 }
 
 const play = async (e: ReturnType<typeof engine>['e']): Promise<number> => {
@@ -21,7 +21,18 @@ const play = async (e: ReturnType<typeof engine>['e']): Promise<number> => {
   return n
 }
 
-describe('Vertex: переход на lite', () => {
+describe('Vertex: запасная модель', () => {
+  it('по умолчанию основная — lite, запасная — обычная', async () => {
+    const calls: string[] = []
+    const fetch = (async (url: string) => {
+      calls.push(String(url).includes('flash-lite-tts') ? 'lite' : 'main')
+      return calls.length === 1 ? new Response('{}', { status: 429 }) : sse()
+    }) as typeof globalThis.fetch
+    const e = createVertexEngine({ project: 'p', token: async () => 't', fetch })
+    expect(await play(e)).toBe(1)
+    expect(calls).toEqual(['lite', 'main'])
+  })
+
   it('основная отвечает — lite не зовётся', async () => {
     const { e, calls } = engine(async () => sse())
     expect(await play(e)).toBe(1)
