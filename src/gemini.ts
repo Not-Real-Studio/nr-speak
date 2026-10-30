@@ -53,6 +53,8 @@ export interface VertexOpts extends RetryOpts {
   model?: string | undefined
   /** Студийный голос для `voice: ''`. */
   defaultVoice?: string | undefined
+  /** Сколько ждать первый звук основной модели до перехода на lite, мс. */
+  liteFirstMs?: number | undefined
   /** Свежий OAuth-токен (у сервиса — `gcloud auth application-default print-access-token`). */
   token: () => Promise<string>
   /** Сколько держать токен, мс (по умолчанию 50 мин; живёт он час). */
@@ -66,6 +68,10 @@ export const GEMINI_TTS_MODEL = 'gemini-3.8-flash-lite-tts'
 export const GEMINI_DEFAULT_VOICE = 'Charon'
 export const GEMINI_VOICE_LIMIT = 200
 export const VERTEX_TTS_MODEL = 'gemini-3.8-flash-tts'
+/** Запасная модель Vertex: на замере 30.10 первый байт 0.5 с и ни одного 429 (DEV-569). */
+export const VERTEX_LITE_TTS_MODEL = 'gemini-3.8-flash-lite-tts'
+/** Сколько ждать первый звук основной модели Vertex, мс. */
+export const VERTEX_LITE_FIRST_MS = 3000
 export const VERTEX_DEFAULT_VOICE = 'Kore'
 export const VERTEX_LOCATION = 'global'
 
@@ -278,10 +284,42 @@ interface SpeakReq {
   body: Record<string, unknown>
   retry: RetryOpts
   signal?: AbortSignal
+  /** Запасная модель: основная упала или молчит `firstMs` — фраза уходит ей сразу, без пауз на 429. */
+  lite?: { url: string; model: string; firstMs: number } | undefined
 }
 
-/** Синтез стримом: запрос, повторы 429 (и 401 — раз), SSE → кадры PCM. */
+/** Синтез с запасной моделью: до первого звука основной — без повторов, дальше её поток как есть. */
 async function* speakStream(r: SpeakReq): AsyncGenerator<AudioChunk> {
+  const { lite, ...req } = r
+  if (!lite) return yield* speakOnce(req)
+  const ctl = new AbortController()
+  const stop = (): void => ctl.abort()
+  r.signal?.addEventListener('abort', stop, { once: true })
+  const timer = setTimeout(stop, lite.firstMs)
+  const it = speakOnce({ ...req, retry: { ...r.retry, retries: 0 }, signal: ctl.signal })[Symbol.asyncIterator]()
+  let first: IteratorResult<AudioChunk> | undefined
+  try {
+    first = await it.next()
+  } catch {
+    // упала, 429 или отменена по таймеру — запасной
+  } finally {
+    clearTimeout(timer)
+  }
+  try {
+    if (r.signal?.aborted) return
+    if (!first || first.done) {
+      await it.return?.(undefined)?.catch?.(() => {})
+      return yield* speakOnce({ ...req, url: lite.url, model: lite.model })
+    }
+    yield first.value
+    for (let n = await it.next(); !n.done; n = await it.next()) yield n.value
+  } finally {
+    r.signal?.removeEventListener('abort', stop)
+  }
+}
+
+/** Один запрос стримом: повторы 429 (и 401 — раз), SSE → кадры PCM. */
+async function* speakOnce(r: SpeakReq): AsyncGenerator<AudioChunk> {
   const retries = r.retry.retries ?? 3
   const maxWait = r.retry.maxRetryWait ?? 30_000
   const sleep = r.retry.sleep ?? abortableSleep
@@ -482,7 +520,10 @@ export function createVertexEngine(o: VertexOpts): TtsEngine {
   const http = o.fetch ?? fetch
   const ttl = o.tokenTtl ?? 50 * 60_000
   const now = o.now ?? Date.now
-  const url = `${o.baseUrl ? geminiRoot(o.baseUrl) : vertexRoot(location)}/v1/projects/${encodeURIComponent(o.project)}/locations/${encodeURIComponent(location)}/publishers/google/models/${model}:streamGenerateContent?alt=sse`
+  const modelUrl = (m: string): string =>
+    `${o.baseUrl ? geminiRoot(o.baseUrl) : vertexRoot(location)}/v1/projects/${encodeURIComponent(o.project)}/locations/${encodeURIComponent(location)}/publishers/google/models/${m}:streamGenerateContent?alt=sse`
+  const url = modelUrl(model)
+  const lite = model === VERTEX_TTS_MODEL ? { url: modelUrl(VERTEX_LITE_TTS_MODEL), model: VERTEX_LITE_TTS_MODEL, firstMs: o.liteFirstMs ?? VERTEX_LITE_FIRST_MS } : undefined
   const token = vertexToken(o.token, ttl, now)
 
   return {
@@ -506,6 +547,7 @@ export function createVertexEngine(o: VertexOpts): TtsEngine {
         model,
         body: speakBody(text, voice, opts),
         retry: o,
+        lite,
         ...(signal ? { signal } : {}),
       })
     },
