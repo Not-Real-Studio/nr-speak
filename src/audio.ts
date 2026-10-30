@@ -126,7 +126,9 @@ export function ffmpegArgs(mime: string, to: Format, speed = 1, live = false): s
         : ['-f', 's16le', '-ar', String(OUT_RATE), '-ac', '1']
   // live — труба: кадры наружу сразу, без буфера муксера (первый звук раньше).
   const flush = live ? ['-flush_packets', '1'] : []
-  return ['-hide_banner', '-loglevel', 'error', ...input, '-i', 'pipe:0', ...filter, ...output, ...flush, 'pipe:1']
+  // Сырой PCM описан флагами, зондировать нечего: ffmpeg 8 иначе держит первый кадр ~1.6 с (DEV-570).
+  const noProbe = live && !isMp3(mime) && !isWav(mime) ? ['-probesize', '32', '-analyzeduration', '0'] : []
+  return ['-hide_banner', '-loglevel', 'error', ...noProbe, ...input, '-i', 'pipe:0', ...filter, ...output, ...flush, 'pipe:1']
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * Локальные движки (DEV-520): OmniVoice на лаптопе (GPU) и PocketTTS-RU на m2 (CPU) — свой
+ * Локальные движки (DEV-520): OmniVoice на лаптопе (GPU) и PocketTTS-RU на nexus (CPU) — свой
  * сервер `serve/local_tts.py`, OpenAI-совместимый `POST /v1/audio/speech` с потоком PCM s16le
  * 24 кГц. Голос движка:
  *

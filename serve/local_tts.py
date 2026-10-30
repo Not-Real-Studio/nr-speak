@@ -227,16 +227,17 @@ def main():
     ap.add_argument("--accent", choices=["silero", "ruaccent", "none"], default="silero", help="pocket: ударения")
     ap.add_argument("--accent-model", default="turbo3.1")
     ap.add_argument("--accent-tiny", action="store_true")
-    ap.add_argument("--threads", type=int, default=0, help="потоков torch на CPU (m2 — не всё ядро: там Лена и распознавание)")
+    ap.add_argument("--threads", type=int, default=0, help="потоков torch на CPU: m2 — не всё ядро, там Лена и распознавание; nexus — 4, дальше pocket не ускоряется")
     ap.add_argument("--warmup", default="Проверка голоса: раз, два, три.")
     args = ap.parse_args()
 
+    t0 = time.time()
+    engine = OmniVoiceEngine(args) if args.engine == "omnivoice" else PocketEngine(args)
     if args.threads:
+        # После загрузки: pocket-tts при импорте сбрасывает torch на один поток.
         import torch
 
         torch.set_num_threads(args.threads)
-    t0 = time.time()
-    engine = OmniVoiceEngine(args) if args.engine == "omnivoice" else PocketEngine(args)
     voices = Voices(engine, args.data)
     gen_lock = threading.Lock()
     state = {"busy": False, "started": time.time()}

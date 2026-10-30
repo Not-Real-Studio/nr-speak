@@ -9,10 +9,11 @@
 
 | машина | движок | порт | как запущен | данные |
 |---|---|---|---|---|
-| m2 (`100.73.94.99`) | pocket | 8096 | launchd `studio.pocket-tts` (`studio.pocket-tts.plist`) | `~/nr/tts` (venv, `data/voices`, `hf`), лог `~/nr/logs/pocket-tts.log` |
+| nexus (`100.118.48.105`) | pocket | 8096 | systemd --user `studio.pocket-tts`, `$services pocket-tts` в `envs/contours.mdz`, `runz host install --service=pocket-tts` (DEV-570) | `~/.local/share/speak/local-tts` (venv, `data/voices`, `hf`, лог `pocket-tts.log`) |
+| m2 (`100.73.94.99`) | pocket, выключен с 30.10 | 8096 | launchd `studio.pocket-tts`, `disable`, plist на месте | `~/nr/tts` |
 | laptop (`100.116.193.14`) | omnivoice | 8095 | задача планировщика `studio-omnivoice` при входе → `omnivoice-serve.cmd` (цикл перезапуска) | `E:\nr\tts` (venv, `data\voices`, `hf`), лог `E:\nr\tts\omnivoice.log` |
 
-Установка: m2 — `uv venv ~/nr/tts/venv --python 3.12` + `uv pip install pocket-tts soundfile torch silero-stress numpy`;
+Установка: nexus — venv + `uv pip install --torch-backend=cpu pocket-tts soundfile torch silero-stress numpy`; m2 — `uv venv ~/nr/tts/venv --python 3.12` + `uv pip install pocket-tts soundfile torch silero-stress numpy`;
 лаптоп — `install-omnivoice.cmd` (кэши uv/HF/TEMP — на E:, на C: места нет). Обновить сервер — скопировать
 `local_tts.py` (m2 — `scp` + `launchctl kickstart -k gui/$(id -u)/studio.pocket-tts`; лаптоп — ssh не пускает,
 через nr-mcp laptop), перезапуск лаптопа — закрыть окно `studio-omnivoice` и запустить задачу.
@@ -44,3 +45,9 @@ silero-stress; односложным словам ударение снимае
 Через speak на m4 (mp3, первый байт): первая фраза 2.1 с (лаптоп в тротлинге, переход на pocket по порогу 1.5 с),
 следующие 0.20–0.21 с (лаптоп в паузе 5 мин, сразу pocket), `@denis-pocket` 0.12 с, `openai:vertex:Sulafat` 3.7 с.
 e2e-live `acceptance-voice-rp` (VRP-1, «Разговор» в RP) на lab — passed.
+
+## Перенос на nexus 30.10.2026 (DEV-570)
+
+Pocket на Xeon 6230N: RTF 0.37–0.44, дальше 4 потоков не ускоряется, поэтому `--threads=4`, узел NUMA 1. Первый звук 0.12 с на
+сервере, 0.29 с через `runz speak`. pocket-tts и silero-stress при импорте ставят torch на один поток: `--threads` применяется после загрузки.
+Замеры всех CPU-моделей и облака — `appz/speak.dev/research/2026-10-cpu-tts-nexus.md`.

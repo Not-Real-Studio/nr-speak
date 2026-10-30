@@ -42,7 +42,7 @@
     "fflate": "^0.8.3",
     "linkedom": "^0.18.13",
     "mammoth": "^1.13.0",
-    "msedge-tts": "^2.0.9",
+    "msedge-tts": "^2.1.1",
     "remark-frontmatter": "^5.0.0",
     "remark-gfm": "^4.0.1",
     "remark-parse": "^11.0.0",
