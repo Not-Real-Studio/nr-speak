@@ -267,10 +267,18 @@ interface GeminiChunk {
 export function speakBody(text: string, voiceId: string, opts: SpeakOpts): Record<string, unknown> {
   const part: Record<string, unknown> = { text }
   if (opts.instruct?.trim()) part.speech_metadata = { style: opts.instruct.trim() }
+  const languageCode = textLanguage(text)
   return {
     contents: [{ role: 'user', parts: [part] }],
-    generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: voiceConfig(voiceId) } },
+    generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: voiceConfig(voiceId), ...(languageCode ? { languageCode } : {}) } },
   }
+}
+
+/** Язык реплики: автоопределение модели иногда читает русский с английским акцентом (DEV-569). */
+export function textLanguage(text: string): string | undefined {
+  const cyr = text.match(/\p{Script=Cyrillic}/gu)?.length ?? 0
+  const lat = text.match(/\p{Script=Latin}/gu)?.length ?? 0
+  return cyr > 0 && cyr >= lat ? 'ru-RU' : undefined
 }
 
 interface SpeakReq {

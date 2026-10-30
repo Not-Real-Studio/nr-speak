@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createVertexEngine } from '../src/gemini.js'
+import { createVertexEngine, speakBody, textLanguage } from '../src/gemini.js'
 
 const sse = (): Response => {
   const data = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ inlineData: { data: 'AAAA', mimeType: 'audio/L16;rate=24000' } }] } }] })}\n\n`
@@ -49,5 +49,18 @@ describe('Vertex: запасная модель', () => {
     const { e, calls } = engine((signal) => new Promise((_, rej) => signal?.addEventListener('abort', () => rej(new Error('abort')))))
     expect(await play(e)).toBe(1)
     expect(calls).toEqual(['main', 'lite'])
+  })
+})
+
+describe('язык реплики', () => {
+  it('русский текст — ru-RU, в том числе с английскими терминами', () => {
+    expect(textLanguage('Запустил runz release, всё прошло.')).toBe('ru-RU')
+    const cfg = (speakBody('Привет', 'Sulafat', {}).generationConfig as { speechConfig: Record<string, unknown> }).speechConfig
+    expect(cfg.languageCode).toBe('ru-RU')
+  })
+
+  it('английский текст и текст без букв — автоопределение', () => {
+    expect(textLanguage('Hello, this is a plain English sentence.')).toBeUndefined()
+    expect(textLanguage('12345')).toBeUndefined()
   })
 })
