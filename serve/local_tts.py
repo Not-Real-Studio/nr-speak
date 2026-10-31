@@ -316,6 +316,7 @@ def main():
     ap.add_argument("--accent-model", default="turbo3.1")
     ap.add_argument("--accent-tiny", action="store_true")
     ap.add_argument("--threads", type=int, default=0, help="потоков torch на CPU: m2 — не всё ядро, там Лена и распознавание; nexus — 4, дальше pocket не ускоряется")
+    ap.add_argument("--num-step", type=int, default=0, help="OmniVoice: шаги по умолчанию, 0 — как в модели (DEV-581: 16 на слух не хуже 32)")
     ap.add_argument("--warmup", default="Проверка голоса: раз, два, три.")
     args = ap.parse_args()
 
@@ -459,7 +460,7 @@ def main():
                 return self.error(404, f"нет образца «{e.args[0]}» — загрузите PUT /v1/voices/<id>", "voice_not_found")
             t1 = time.time()
             ahead = b.get("priority") == "ahead"
-            it = synth(text, voice, (b.get("instructions") or "").strip() or None, self.gone, gate.job(not ahead, b.get("job") or None), b.get("num_step"))
+            it = synth(text, voice, (b.get("instructions") or "").strip() or None, self.gone, gate.job(not ahead, b.get("job") or None), b.get("num_step") or args.num_step or None)
             try:
                 first = next(it)
             except Gone:
