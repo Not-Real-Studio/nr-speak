@@ -112,7 +112,8 @@ const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>()\]]+[^\s<>()\].,;:!?»"']/giu
 
 /** Чистка строки для слуха: голые адреса, мусор-токены, сноски, пустые скобки, пробелы. */
 export function cleanInline(s: string): string {
-  return stripTokens(s.replace(URL_RE, ''))
+  // Разметка без пары: стрим режет фразу посреди `**жирного**`, парсер оставляет маркеры текстом.
+  return stripTokens(s.replace(URL_RE, '').replace(/\*{2,3}|__|~~|`+/g, ''))
     .replace(NOTE, '')
     .replace(/\s*:\s*(?=[.,;!?])/g, '')
     .replace(/\(\s*[,;]?\s*\)|\[\s*\]|`\s*`/g, '')
