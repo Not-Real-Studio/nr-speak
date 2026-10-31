@@ -21,7 +21,7 @@ describe('speaker', () => {
     expect(a.voice).toEqual({ engine: 'vertex', voice: 'Kore' })
     const b = await s.synth('Привет', { voice: 'Kore' }, 'pcm')
     expect(b.cached).toBe(true)
-    expect(s.stats).toEqual({ synth: 1, hits: 1 })
+    expect(s.stats).toMatchObject({ synth: 1, hits: 1 })
     expect(v.calls.length).toBe(1)
     expect(a.key).toMatch(/^[0-9a-f]{64}\.pcm$/)
     expect((await s.key('Привет', { speed: 1.1 }, 'pcm')).key).not.toBe(a.key)

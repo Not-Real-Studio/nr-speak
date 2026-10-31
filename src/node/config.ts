@@ -18,6 +18,7 @@ import { createOpenAIEngine } from '../openai.js'
 import { createSayEngine, hasSay } from './say.js'
 import { createFallbackEngine, createLocalEngine } from '../local.js'
 import { fileSampleLoader } from './sample.js'
+import type { ParallelOpts } from '../speaker.js'
 
 /** Структурно — `IContext` runz: сервису нужен только `get`. */
 interface Ctx {
@@ -160,6 +161,19 @@ export function listOf(v: unknown): string[] | undefined {
   if (Array.isArray(v)) return v.map(String)
   if (typeof v === 'object' && v && 'iterate' in v && typeof (v as { iterate: unknown }).iterate === 'function') return [...(v as { iterate(): Iterable<unknown> }).iterate()].map(String)
   return String(v).split(',').map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * Параллельный голос (DEV-577): `$parallel_voice` (`@sulafat-local`) блока `## $speak`,
+ * `$parallel_first_ms` (порог, 1000), `$parallel_for` (страхуемые голоса; нет — голос по умолчанию).
+ * Нет `$parallel_voice` или он `off` — без гонки.
+ */
+export function parallelFromCtx(ctx: unknown): ParallelOpts | undefined {
+  const voice = str(speakOpt(ctx, 'parallel_voice'))
+  if (!voice || /^(off|none|-)$/i.test(voice)) return undefined
+  const ms = Number(speakOpt(ctx, 'parallel_first_ms'))
+  const insured = listOf(speakOpt(ctx, 'parallel_for'))
+  return { voice, ...(Number.isFinite(ms) && ms > 0 ? { firstAudioMs: ms } : {}), ...(insured?.length ? { for: insured } : {}) }
 }
 
 export interface EnginesFromCtxOpts {

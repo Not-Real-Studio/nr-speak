@@ -16,6 +16,8 @@ API:
                                умолчанию; неизвестный образец — 404 code voice_not_found
 
 Один синтез за раз (замок): GPU и CPU m2 не делятся. Темп — не здесь: speak ставит его ffmpeg.
+Клиент ушёл (гонка голосов DEV-577 снимает проигравшего) — запрос выходит из очереди сразу, идущий
+синтез обрывается на следующем кадре: отменённые не копятся и не держат замок.
 """
 
 import argparse
@@ -24,6 +26,8 @@ import io
 import json
 import os
 import re
+import select
+import socket
 import sys
 import threading
 import time
@@ -57,6 +61,10 @@ def sentences(text, max_chars=300):
         if s:
             out.append(s)
     return out
+
+
+class Gone(Exception):
+    """Клиент закрыл соединение: синтез ему больше не нужен."""
 
 
 def to_pcm(audio, rate):
@@ -240,7 +248,7 @@ def main():
         torch.set_num_threads(args.threads)
     voices = Voices(engine, args.data)
     gen_lock = threading.Lock()
-    state = {"busy": False, "started": time.time()}
+    state = {"busy": False, "started": time.time(), "waiting": 0, "cancelled": 0}
     log(f"{engine.name}: модель {engine.model_id} на {engine.device} за {time.time() - t0:.1f} с")
 
     def resolve(vid):
@@ -256,15 +264,30 @@ def main():
             raise KeyError(vid)
         return v
 
-    def synth(text, voice, instruct):
-        with gen_lock:
-            state["busy"] = True
-            try:
-                for s in sentences(text):
-                    for pcm in engine.generate(s, voice, instruct):
-                        yield pcm
-            finally:
-                state["busy"] = False
+    def acquire(gone):
+        state["waiting"] += 1
+        try:
+            while not gen_lock.acquire(timeout=0.05):
+                if gone():
+                    raise Gone()
+        finally:
+            state["waiting"] -= 1
+
+    def synth(text, voice, instruct, gone=lambda: False):
+        acquire(gone)
+        state["busy"] = True
+        try:
+            for s in sentences(text):
+                for pcm in engine.generate(s, voice, instruct):
+                    if gone():
+                        raise Gone()
+                    yield pcm
+        except Gone:
+            state["cancelled"] += 1
+            raise
+        finally:
+            state["busy"] = False
+            gen_lock.release()
 
     # Прогрев: первая фраза после старта не платит за компиляцию ядер и кэш.
     warm = args.default_voice if args.default_voice in voices.ids() else (voices.ids()[:1] or [None])[0]
@@ -292,6 +315,14 @@ def main():
             self.end_headers()
             self.wfile.write(body)
 
+        def gone(self):
+            """Соединение закрыто клиентом: сокет читаем, а данных нет (тело запроса уже прочитано)."""
+            try:
+                ready, _, _ = select.select([self.connection], [], [], 0)
+                return bool(ready) and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+            except OSError:
+                return True
+
         def error(self, code, message, kind=None):
             self.send_json(code, {"error": {"message": message, **({"code": kind} if kind else {})}})
 
@@ -302,7 +333,7 @@ def main():
 
         def do_GET(self):
             if self.path == "/health":
-                return self.send_json(200, {"ok": True, "engine": engine.name, "model": engine.model_id, "device": engine.device, "voices": voices.ids(), "busy": state["busy"], "uptime": round(time.time() - state["started"])})
+                return self.send_json(200, {"ok": True, "engine": engine.name, "model": engine.model_id, "device": engine.device, "voices": voices.ids(), "busy": state["busy"], "waiting": state["waiting"], "cancelled": state["cancelled"], "uptime": round(time.time() - state["started"])})
             if self.path.startswith("/v1/audio/voices"):
                 return self.send_json(200, {"voices": [{"id": v, "text": voices.text_of(v)} for v in voices.ids()]})
             self.error(404, "not found")
@@ -337,9 +368,13 @@ def main():
             except KeyError as e:
                 return self.error(404, f"нет образца «{e.args[0]}» — загрузите PUT /v1/voices/<id>", "voice_not_found")
             t1 = time.time()
-            it = synth(text, voice, (b.get("instructions") or "").strip() or None)
+            it = synth(text, voice, (b.get("instructions") or "").strip() or None, self.gone)
             try:
                 first = next(it)
+            except Gone:
+                log(f"снят до первого звука за {time.time() - t1:.2f} с")
+                self.close_connection = True
+                return
             except StopIteration:
                 return self.error(500, "модель не прислала звука")
             except LookupError as e:
@@ -371,9 +406,10 @@ def main():
                         chunk(pcm)
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, Gone):
                 it.close()
                 log("клиент ушёл посреди синтеза")
+                self.close_connection = True
                 return
             except Exception as e:  # noqa: BLE001
                 # Заголовок уже ушёл: обрываем поток без завершающего куска — клиент видит обрыв, не тишину.

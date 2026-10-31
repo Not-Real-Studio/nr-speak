@@ -3,7 +3,7 @@
  * gcloud, кэш кусков на диске, ffmpeg, html → markdown (Defuddle).
  */
 
-export { defaultVoiceProvider, engineFromCtx, enginesFromCtx, fileCache, gcloudToken, isVertex, listOf, providerOf, speakOpt } from './config.js'
+export { defaultVoiceProvider, engineFromCtx, enginesFromCtx, fileCache, gcloudToken, isVertex, listOf, parallelFromCtx, providerOf, speakOpt } from './config.js'
 export type { EngineFromCtxOpts, EnginesFromCtxOpts, VoiceProvider } from './config.js'
 export { diskCache } from './cache.js'
 export { ffmpegPipe, ffmpegRunner } from './ffmpeg.js'

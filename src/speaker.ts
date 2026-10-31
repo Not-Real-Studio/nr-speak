@@ -15,6 +15,8 @@ import { collect, concat, CONTENT_TYPE, convert, ffmpegArgs, OUT_RATE, wavHeader
 import type { AudioChunk, SpeakOpts, TtsEngine } from './types.js'
 import { isMp3, isPcm, rateOf } from './types.js'
 import { createFallbackEngine } from './local.js'
+import type { PrimaryRun } from './race.js'
+import { pickFirst, startPrimary } from './race.js'
 
 export interface SegmentCache {
   get(key: string): Promise<Uint8Array | undefined>
@@ -34,6 +36,41 @@ export interface SpeakRequest {
    * под ключом основного.
    */
   fallback?: readonly string[] | undefined
+  /**
+   * Кусок для живого слушателя (DEV-577): `now` — нужен для игры сейчас, идёт гонка с параллельным
+   * голосом (`SpeakerOpts.parallel`); `ahead` — предзагрузка: только основной голос, гонка начнётся,
+   * когда тот же кусок попросят с `now`. Нет поля — без гонки (рендер книг, CLI, стенд голосов).
+   */
+  play?: 'now' | 'ahead' | undefined
+}
+
+/** Параллельный голос (DEV-577): страховка от молчания основного на каждом куске. */
+export interface ParallelOpts {
+  /** Голос-страховка (`@sulafat-local`): его `$fallback` не действует — страховке запасной не нужен. */
+  voice: string
+  /** Первый звук основного — за столько мс от момента, когда кусок нужен, иначе играет параллельный (по умолчанию 1000). */
+  firstAudioMs?: number | undefined
+  /** Какие голоса страхуются (`vertex:Sulafat`); нет — только голос по умолчанию: клон подходит своему оригиналу. */
+  for?: readonly string[] | undefined
+  /** Основной, проигравший или предзагруженный, живёт не дольше (по умолчанию 120 000). */
+  primaryMaxMs?: number | undefined
+}
+
+/** Журнал гонки: кто сыграл кусок и первый звук обоих. */
+export interface PieceEvent {
+  key: string
+  /** Основной голос (`vertex:Sulafat`). */
+  voice: string
+  played: 'primary' | 'parallel'
+  reason?: string | undefined
+  /** Мс от момента «нужен» до звука, отданного наружу. */
+  firstMs: number
+  /** Первый звук основного от его старта; нет — упал. */
+  primaryMs?: number | undefined
+  /** Основной начат заранее, за столько мс до того, как кусок понадобился. */
+  aheadMs?: number | undefined
+  /** Первый звук параллельного от момента «нужен». */
+  parallelMs?: number | undefined
 }
 
 export interface SynthResult {
@@ -70,6 +107,10 @@ export interface SpeakerOpts {
   chainFirstAudioMs?: number | undefined
   /** То же для второго и дальше звена (облако думает дольше локального; по умолчанию 20 000 — переход по ошибке). */
   chainNextAudioMs?: number | undefined
+  /** Гонка с параллельным голосом на кусках `play` (DEV-577); нет — без гонки. */
+  parallel?: ParallelOpts | undefined
+  /** Кусок сыгран в гонке — в лог сервера. Приходит, когда известен первый звук основного или его отказ. */
+  onPiece?: ((e: PieceEvent) => void) | undefined
   /** Цепочка перешла на запасной голос — в лог сервера. */
   onChainFallback?: ((e: { voice: string; reason: string }) => void) | undefined
   /** Хедж сработал (куда и чем кончился) — в лог сервера. */
@@ -80,7 +121,7 @@ export interface Speaker {
   readonly engines: Engines
   readonly defaultVoice: string | undefined
   /** Счётчики: синтезов и попаданий в кэш с момента создания. */
-  readonly stats: { synth: number; hits: number }
+  readonly stats: { synth: number; hits: number; primary: number; parallel: number }
   resolve(voice?: string, engine?: string): Promise<Resolved>
   voices(engine?: string): Promise<{ voices: CatalogVoice[]; errors: { engine: EngineName; error: string }[] }>
   /** Ключ кэша куска (без синтеза). */
@@ -148,7 +189,7 @@ export const segmentKey = (engine: string, voice: string, instruct: string, spee
   sha256([engine, voice, instruct, String(speed), text].join('|'))
 
 export function createSpeaker(o: SpeakerOpts): Speaker {
-  const stats = { synth: 0, hits: 0 }
+  const stats = { synth: 0, hits: 0, primary: 0, parallel: 0 }
   const speedOf = (req: SpeakRequest): number => {
     const s = req.speed ?? 1
     if (!Number.isFinite(s) || s < 0.25 || s > 4) throw new Error(`speak: темп ${req.speed} вне 0.25…4`)
@@ -198,6 +239,29 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
   const engineFor = (voice: Resolved, req: SpeakRequest): Promise<TtsEngine> | TtsEngine =>
     req.fallback?.length ? chainOf(voice, req.fallback) : o.engines[voice.engine]!
 
+  // Гонка: голос-страховка без своей цепочки и список страхуемых голосов — один раз на сервер.
+  const raced = (async (): Promise<{ engine: TtsEngine; voice: string; insured: Set<string> } | undefined> => {
+    const p = o.parallel
+    if (!p?.voice.trim()) return undefined
+    try {
+      const r = await resolve(p.voice)
+      const insured = new Set<string>()
+      for (const v of p.for?.length ? p.for : [o.defaultVoice ?? '']) {
+        const m = await resolve(v || undefined)
+        insured.add(`${m.engine}:${m.voice}`)
+      }
+      return { engine: o.engines[r.engine]!, voice: r.voice, insured }
+    } catch {
+      // Голос-страховка не настроен на этом сервере — живём без гонки.
+      return undefined
+    }
+  })()
+  const raceFor = async (voice: Resolved, req: SpeakRequest): Promise<{ engine: TtsEngine; voice: string } | undefined> => {
+    if (!req.play) return undefined
+    const r = await raced
+    return r?.insured.has(`${voice.engine}:${voice.voice}`) ? r : undefined
+  }
+
   async function key(text: string, req0: SpeakRequest, format: Format): Promise<{ key: string; voice: Resolved }> {
     const req = await expandCollection(req0, o.collection)
     const voice = await resolve(req.voice, req.engine)
@@ -206,11 +270,62 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
 
   // Один и тот же кусок разом (клиент + предзагрузка) — один синтез.
   const inflight = new Map<string, Promise<SynthResult>>()
+  // Основные голоса кусков гонки: живут мимо клиента и дописывают звук в кэш.
+  const runs = new Map<string, { run: PrimaryRun<SynthResult>; at: number }>()
+
+  const speakOpts = (engine: TtsEngine, req: SpeakRequest, format: Format): SpeakOpts => {
+    const speed = speedOf(req)
+    return {
+      ...(req.instruct?.trim() ? { instruct: req.instruct.trim() } : {}),
+      ...(engine.nativeSpeed && speed !== 1 ? { speed } : {}),
+      format: format === 'mp3' ? 'mp3' : 'pcm',
+    }
+  }
+
+  async function primaryOf(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved): Promise<{ run: PrimaryRun<SynthResult>; at: number }> {
+    const had = runs.get(k)
+    if (had && !had.run.failed()) return had
+    const engine = await engineFor(voice, req)
+    const again = runs.get(k)
+    if (again && !again.run.failed()) return again
+    const speed = speedOf(req)
+    stats.synth++
+    const run = startPrimary<SynthResult>(
+      (sig) => engine.speak(text, voice.voice, speakOpts(engine, req, format), sig),
+      async (frames) => {
+        const mime = frames[0]!.mime
+        const data = await convert({ data: concat(frames.map((c) => c.data)), mime }, format, { speed: engine.nativeSpeed ? 1 : speed, ffmpeg: o.ffmpeg })
+        if (!frames[0]!.fallback) await o.cache?.set(k, data)
+        return { data, contentType: CONTENT_TYPE[format], cached: false, key: k, voice }
+      },
+      o.parallel?.primaryMaxMs ?? 120_000,
+    )
+    const entry = { run, at: Date.now() }
+    runs.set(k, entry)
+    inflight.set(k, run.done)
+    const clear = (): void => {
+      if (runs.get(k) === entry) runs.delete(k)
+      if (inflight.get(k) === run.done) inflight.delete(k)
+    }
+    run.done.then(clear, clear)
+    // Упавший — сразу из таблицы: следующая просьба запускает основной заново.
+    run.first.catch(clear)
+    return entry
+  }
 
   async function synth(text: string, req0: SpeakRequest, format: Format, signal?: AbortSignal): Promise<SynthResult> {
     if (!text.trim()) throw new Error('speak: пустой текст')
     const req = await expandCollection(req0, o.collection)
     const { key: k, voice } = await key(text, req, format)
+    if (await raceFor(voice, req)) {
+      // Целым куском гонки нет: предзагрузка копит основной, потоком играет `live`.
+      const hit = await o.cache?.get(k)
+      if (hit) {
+        stats.hits++
+        return { data: hit, contentType: CONTENT_TYPE[format], cached: true, key: k, voice }
+      }
+      return (await primaryOf(text, req, format, k, voice)).run.done
+    }
     const running = inflight.get(k)
     if (running) return running
     const p = synthOnce(text, req, format, k, voice, signal)
@@ -252,10 +367,110 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     return { data, contentType, cached: false, key: k, voice }
   }
 
+  /** Кадры движка → (ffmpeg-труба) → наружу; `parts` копит отданное. */
+  async function* encoded(head: AudioChunk, it: AsyncIterator<AudioChunk>, tempo: number, format: Format, parts: Uint8Array[]): AsyncGenerator<Uint8Array> {
+    const mime = head.mime
+    const first: IteratorResult<AudioChunk> = { done: false, value: head }
+    const direct = tempo === 1 && ((format === 'mp3' && isMp3(mime)) || (format === 'pcm' && isPcm(mime) && rateOf(mime) === OUT_RATE))
+    if (direct) {
+      for (let n: IteratorResult<AudioChunk> = first; !n.done; n = await it.next()) {
+        parts.push(n.value.data)
+        yield n.value.data
+      }
+    } else if (o.ffmpegPipe && format !== 'wav') {
+      const proc = o.ffmpegPipe(ffmpegArgs(mime, format, tempo, true))
+      let feedErr: unknown
+      let stopped = false
+      const feeding = (async () => {
+        try {
+          for (let n: IteratorResult<AudioChunk> = first; !n.done && !stopped; n = await it.next()) await proc.write(n.value.data)
+          proc.end()
+        } catch (err) {
+          feedErr = err
+          proc.kill()
+        }
+      })()
+      let drained = false
+      try {
+        for await (const b of proc.output) {
+          parts.push(b)
+          yield b
+        }
+        drained = true
+      } finally {
+        // Ушли раньше конца (клиент закрыл поток, ошибка) — ffmpeg и подачу оборвать.
+        if (!drained) {
+          stopped = true
+          proc.kill()
+        }
+      }
+      await feeding
+      if (feedErr !== undefined) throw feedErr
+    } else {
+      // Без трубы — как раньше: собрать, перекодировать, отдать целиком.
+      const rest: AudioChunk[] = [head]
+      for (let n = await it.next(); !n.done; n = await it.next()) rest.push(n.value)
+      const data = await convert({ data: concat(rest.map((c) => c.data)), mime }, format, { speed: tempo, ffmpeg: o.ffmpeg })
+      parts.push(data)
+      yield data
+    }
+  }
+
+  /** Кусок гонки: играет основной или параллельный, основной дописывается в кэш в любом случае. */
+  async function* race(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved, spare: { engine: TtsEngine; voice: string }, signal?: AbortSignal, onFirst: () => void = () => {}): AsyncGenerator<Uint8Array> {
+    const need = Date.now()
+    const { run, at } = await primaryOf(text, req, format, k, voice)
+    const pick = await pickFirst(
+      run,
+      (sig) => spare.engine.speak(text, spare.voice, speakOpts(spare.engine, req, format), sig),
+      o.parallel?.firstAudioMs ?? 1000,
+      signal,
+    )
+    if (pick.winner === 'primary') stats.primary++
+    else stats.parallel++
+    const firstMs = Date.now() - need
+    const report = (): void => {
+      const primaryMs = run.firstMs()
+      o.onPiece?.({
+        key: k,
+        voice: `${voice.engine}:${voice.voice}`,
+        played: pick.winner,
+        firstMs,
+        ...(pick.reason ? { reason: pick.reason } : {}),
+        ...(primaryMs !== undefined ? { primaryMs } : {}),
+        ...(need - at > 5 ? { aheadMs: need - at } : {}),
+        ...(pick.parallelMs !== undefined ? { parallelMs: pick.parallelMs } : {}),
+      })
+    }
+    run.first.then(report, report)
+    onFirst()
+    const native = pick.winner === 'primary' ? (await engineFor(voice, req)).nativeSpeed : spare.engine.nativeSpeed
+    const it = pick.frames[Symbol.asyncIterator]()
+    await it.next()
+    try {
+      yield* encoded(pick.first, it, native ? 1 : speedOf(req), format, [])
+    } finally {
+      await it.return?.(undefined)?.catch?.(() => {})
+    }
+  }
+
   /** Кусок потоком: кэш/идущий синтез — целиком; иначе кадры движка → (ffmpeg-труба) → наружу и в кэш. */
   async function* live(text: string, req: SpeakRequest, format: Format, signal?: AbortSignal, onFirst: () => void = () => {}): AsyncGenerator<Uint8Array> {
     if (!text.trim()) throw new Error('speak: пустой текст')
     const { key: k, voice } = await key(text, req, format)
+    const spare = await raceFor(voice, req)
+    if (spare) {
+      const hit = await o.cache?.get(k)
+      if (hit) {
+        stats.hits++
+        onFirst()
+        return yield hit
+      }
+      if (req.play === 'now') return yield* race(text, req, format, k, voice, spare, signal, onFirst)
+      const r = await (await primaryOf(text, req, format, k, voice)).run.done
+      onFirst()
+      return yield r.data
+    }
     const running = inflight.get(k)
     if (running) {
       const r = await running
@@ -297,49 +512,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     inflight.set(k, done)
     let complete = false
     try {
-      const direct = tempo === 1 && ((format === 'mp3' && isMp3(mime)) || (format === 'pcm' && isPcm(mime) && rateOf(mime) === OUT_RATE))
-      if (direct) {
-        for (let n: IteratorResult<AudioChunk> = first; !n.done; n = await it.next()) {
-          parts.push(n.value.data)
-          yield n.value.data
-        }
-      } else if (o.ffmpegPipe && format !== 'wav') {
-        const proc = o.ffmpegPipe(ffmpegArgs(mime, format, tempo, true))
-        let feedErr: unknown
-        let stopped = false
-        const feeding = (async () => {
-          try {
-            for (let n: IteratorResult<AudioChunk> = first; !n.done && !stopped; n = await it.next()) await proc.write(n.value.data)
-            proc.end()
-          } catch (err) {
-            feedErr = err
-            proc.kill()
-          }
-        })()
-        let drained = false
-        try {
-          for await (const b of proc.output) {
-            parts.push(b)
-            yield b
-          }
-          drained = true
-        } finally {
-          // Ушли раньше конца (клиент закрыл поток, ошибка) — ffmpeg и подачу оборвать.
-          if (!drained) {
-            stopped = true
-            proc.kill()
-          }
-        }
-        await feeding
-        if (feedErr !== undefined) throw feedErr
-      } else {
-        // Без трубы — как раньше: собрать, перекодировать, отдать целиком.
-        const rest: AudioChunk[] = [first.value]
-        for (let n = await it.next(); !n.done; n = await it.next()) rest.push(n.value)
-        const data = await convert({ data: concat(rest.map((c) => c.data)), mime }, format, { speed: tempo, ffmpeg: o.ffmpeg })
-        parts.push(data)
-        yield data
-      }
+      yield* encoded(first.value, it, tempo, format, parts)
       if (signal?.aborted) throw new Error('speak: синтез отменён')
       const data = concat(parts)
       complete = true
@@ -363,6 +536,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     const req = await expandCollection(req0, o.collection)
     // wav: один заголовок на поток, куски — сырым PCM.
     const part: Format = format === 'wav' ? 'pcm' : format
+    const racing = !!(await raceFor(await resolve(req.voice, req.engine), req))
     let started = false
     let ahead: Promise<SynthResult> | undefined
     for (let i = 0; i < texts.length; i++) {
@@ -371,10 +545,11 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
       const prefetch = (): void => {
         const t = texts[i + 1]
         if (t === undefined || signal?.aborted || next) return
-        next = synth(t, req, part, signal)
+        next = synth(t, racing ? { ...req, play: 'ahead' } : req, part, signal)
         next.catch(() => {})
       }
-      const parts: AsyncIterable<Uint8Array> = ahead
+      // В гонке кусок, заказанный заранее, тоже идёт через `live`: момент «нужен» — сейчас.
+      const parts: AsyncIterable<Uint8Array> = ahead && !racing
         ? (async function* (p: Promise<SynthResult>) {
             const r = await p
             prefetch()
