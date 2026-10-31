@@ -10,9 +10,10 @@
  *                        сервер держит подготовленный промпт в памяти
  *   иначе              — id образца, уже лежащего на сервере
  *
- * `createFallbackEngine` — автопереход: основной не ответил первым звуком за порог (или упал до
- * первого звука) — та же фраза запасным, основной пропускается `cooldownMs`. Звук запасного
- * помечен `fallback` — speaker его не кэширует под ключом основного.
+ * `createFallbackEngine` — автопереход: основной упал до первого звука или молчит за порог и не
+ * отвечает на проверку `alive` — та же фраза запасным, основной пропускается `cooldownMs`. Живой
+ * сервер, занятый очередью, — не сбой: ждём его (DEV-581). Звук запасного помечен `fallback` —
+ * speaker его не кэширует под ключом основного.
  */
 
 import type { AudioChunk, SpeakOpts, TtsEngine, VoiceInfo } from './types.js'
@@ -115,6 +116,13 @@ export function createLocalEngine(o: LocalEngineOpts): TtsEngine {
     promote(job: string) {
       void http(`${base}/v1/queue/${encodeURIComponent(job)}/now`, { method: 'POST', headers: auth, signal: AbortSignal.timeout(3000) }).catch(() => {})
     },
+    async alive() {
+      try {
+        return (await http(`${base}/health`, { headers: auth, signal: AbortSignal.timeout(3000) })).ok
+      } catch {
+        return false
+      }
+    },
     async voices(): Promise<VoiceInfo[]> {
       const res = await http(`${base}/v1/audio/voices`, { headers: auth, signal: AbortSignal.timeout(5000) })
       if (!res.ok) throw statusError(`${o.kind}.voices: HTTP ${res.status}`, res.status)
@@ -184,6 +192,8 @@ export interface FallbackOpts {
   cooldownMs?: number | undefined
   /** Имя запасного в пометке `fallback` (по умолчанию его `kind`). */
   backupName?: string | undefined
+  /** Живой сервер без звука ждём не дольше стольких мс от первого порога (по умолчанию 60 000: завис на карте). */
+  aliveMaxMs?: number | undefined
   onFallback?: ((e: { reason: string; skipped: boolean }) => void) | undefined
   now?: (() => number) | undefined
 }
@@ -195,6 +205,7 @@ export interface FallbackOpts {
 export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: FallbackOpts = {}): TtsEngine {
   const firstMs = o.firstAudioMs ?? 1500
   const cooldown = o.cooldownMs ?? 300_000
+  const aliveMax = o.aliveMaxMs ?? 60_000
   const now = o.now ?? Date.now
   const name = o.backupName ?? backup.kind ?? 'backup'
   let downUntil = 0
@@ -217,6 +228,7 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
       }
     },
     design: (spec) => primary.design(spec),
+    ...(primary.alive ? { alive: () => primary.alive!() } : {}),
     ...(primary.promote
       ? {
           promote(job: string) {
@@ -235,20 +247,31 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
       signal?.addEventListener('abort', onAbort, { once: true })
       const it = primary.speak(text, voiceId, opts, ac.signal)[Symbol.asyncIterator]()
       let timer: ReturnType<typeof setTimeout> | undefined
-      const late = new Promise<'late'>((resolve) => {
-        const arm = (): void => {
-          timer ??= setTimeout(() => resolve('late'), firstMs)
-        }
-        if (opts.priority === 'ahead' && opts.job) waits.set(opts.job, arm)
-        else arm()
-      })
+      let late!: (v: 'late') => void
+      const lateP = new Promise<'late'>((resolve) => (late = resolve))
+      // Порог прошёл: живой занятый сервер ждём дальше, потолок `aliveMax` — от первого порога.
+      let since = 0
+      let answered = false
+      const check = async (): Promise<void> => {
+        since ||= now()
+        const alive = now() - since < aliveMax && (await primary.alive?.())
+        if (answered) return
+        if (alive) timer = setTimeout(() => void check(), firstMs)
+        else late('late')
+      }
+      const arm = (): void => {
+        timer ??= setTimeout(() => void check(), firstMs)
+      }
+      if (opts.priority === 'ahead' && opts.job) waits.set(opts.job, arm)
+      else arm()
       let first: IteratorResult<AudioChunk> | 'late'
       try {
         const next = it.next()
         // Опоздавший ответ основного после перехода не должен всплыть необработанным.
         next.catch(() => {})
-        first = await Promise.race([next, late])
+        first = await Promise.race([next, lateP])
       } catch (err) {
+        answered = true
         clearTimeout(timer)
         if (opts.job) waits.delete(opts.job)
         signal?.removeEventListener('abort', onAbort)
@@ -257,6 +280,7 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
         o.onFallback?.({ reason: String((err as Error)?.message ?? err), skipped: false })
         return yield* viaBackup(text, voiceId, opts, signal)
       }
+      answered = true
       clearTimeout(timer)
       if (opts.job) waits.delete(opts.job)
       if (first === 'late') {

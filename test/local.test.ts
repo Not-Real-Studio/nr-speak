@@ -101,10 +101,29 @@ describe('local engines (DEV-520)', () => {
   it('переход на запасной: нет первого звука за порог', async () => {
     const lap = fakeServer({ delayMs: 500 })
     const m2 = fakeServer()
-    const e = createFallbackEngine(createLocalEngine({ kind: 'omnivoice', baseUrl: 'http://lap', fetch: lap.fetch }), createLocalEngine({ kind: 'pocket', baseUrl: 'http://m2', fetch: m2.fetch }), { firstAudioMs: 50 })
+    const e = createFallbackEngine({ ...createLocalEngine({ kind: 'omnivoice', baseUrl: 'http://lap', fetch: lap.fetch }), alive: async () => false }, createLocalEngine({ kind: 'pocket', baseUrl: 'http://m2', fetch: m2.fetch }), { firstAudioMs: 50 })
     const t0 = Date.now()
     const a = await all(e.speak('Раз.', '', {}))
     expect(Date.now() - t0).toBeLessThan(400)
+    expect(a.every((c) => c.fallback === 'pocket')).toBe(true)
+  })
+
+  it('живой занятый сервер — ждём очередь, без запасного и без пропуска (DEV-581)', async () => {
+    const m2 = fakeServer()
+    const events: unknown[] = []
+    const lap = createLocalEngine({ kind: 'omnivoice', baseUrl: 'http://lap', fetch: fakeServer({ delayMs: 200 }).fetch })
+    const e = createFallbackEngine({ ...lap, alive: async () => true }, createLocalEngine({ kind: 'pocket', baseUrl: 'http://m2', fetch: m2.fetch }), { firstAudioMs: 30, onFallback: (x) => events.push(x) })
+    const a = await all(e.speak('Раз.', '', {}))
+    expect(a.some((c) => c.fallback)).toBe(false)
+    expect(m2.calls).toHaveLength(0)
+    expect(events).toEqual([])
+  })
+
+  it('живой, но завис: потолок ожидания — запасной и пропуск (DEV-581)', async () => {
+    const m2 = fakeServer()
+    const lap = createLocalEngine({ kind: 'omnivoice', baseUrl: 'http://lap', fetch: fakeServer({ delayMs: 400 }).fetch })
+    const e = createFallbackEngine({ ...lap, alive: async () => true }, createLocalEngine({ kind: 'pocket', baseUrl: 'http://m2', fetch: m2.fetch }), { firstAudioMs: 20, aliveMaxMs: 60 })
+    const a = await all(e.speak('Раз.', '', {}))
     expect(a.every((c) => c.fallback === 'pocket')).toBe(true)
   })
 

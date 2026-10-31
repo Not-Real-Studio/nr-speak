@@ -94,6 +94,8 @@ export interface TtsEngine {
   speak(text: string, voiceId: string, opts: SpeakOpts, signal?: AbortSignal): AsyncIterable<AudioChunk>
   /** Движок с очередью (DEV-581): кусок `job` из предзагрузки понадобился — вперёд очереди. */
   promote?(job: string): void
+  /** Сервер движка жив, пусть и занят: молчание — очередь, а не сбой (DEV-581). */
+  alive?(): Promise<boolean>
 }
 
 /** Кэш `(lang|design) → id`: у сервиса, не у движка. */
