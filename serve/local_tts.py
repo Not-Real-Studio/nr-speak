@@ -319,7 +319,7 @@ def main():
             """Соединение закрыто клиентом: сокет читаем, а данных нет (тело запроса уже прочитано)."""
             try:
                 ready, _, _ = select.select([self.connection], [], [], 0)
-                return bool(ready) and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+                return bool(ready) and self.connection.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)) == b""
             except OSError:
                 return True
 
