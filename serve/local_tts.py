@@ -11,11 +11,15 @@ API:
   GET  /v1/audio/voices        {voices: [{id, text}]}
   PUT  /v1/voices/<id>         {audio: base64 WAV, text?} — образец клона; хранится на диске,
                                подготовленный промпт — в памяти (на каждую фразу не перечитывается)
-  POST /v1/audio/speech        {input, voice?, response_format: pcm|wav, instructions?}
+  POST /v1/audio/speech        {input, voice?, response_format: pcm|wav, instructions?, priority?, job?, num_step?}
                                voice — id образца, `design:<атрибуты>` (OmniVoice), пусто — по
-                               умолчанию; неизвестный образец — 404 code voice_not_found
+                               умолчанию; неизвестный образец — 404 code voice_not_found;
+                               priority — `now` (по умолчанию) или `ahead`; job — id для повышения;
+                               num_step — шаги OmniVoice на этот запрос (замер DEV-581)
+  POST /v1/queue/<job>/now     кусок из предзагрузки понадобился: идёт вперёд очереди
 
-Один синтез за раз (замок): GPU и CPU m2 не делятся. Темп — не здесь: speak ставит его ffmpeg.
+Один синтез за раз: GPU и CPU m2 не делятся. Очередь (DEV-581): `now` вперёд `ahead`, внутри — по
+порядку; `ahead` отдаёт карту между предложениями, если ждёт `now`. Темп — не здесь: speak ставит его ffmpeg.
 Клиент ушёл (гонка голосов DEV-577 снимает проигравшего) — запрос выходит из очереди сразу, идущий
 синтез обрывается на следующем кадре: отменённые не копятся и не держат замок.
 """
@@ -67,6 +71,82 @@ class Gone(Exception):
     """Клиент закрыл соединение: синтез ему больше не нужен."""
 
 
+class Job:
+    def __init__(self, seq, now, job_id=None):
+        self.seq = seq
+        self.now = now
+        self.id = job_id
+
+
+class Gate:
+    """Один синтез за раз: `now` вперёд `ahead`, внутри приоритета — по порядку прихода."""
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.holder = None
+        self.waiting = []
+        self.jobs = {}
+        self.seq = 0
+        # Повышение может обогнать сам запрос: id помнится, запрос заберёт его на входе.
+        self.promoted = []
+
+    def job(self, now, job_id=None):
+        with self.cv:
+            self.seq += 1
+            if job_id and job_id in self.promoted:
+                self.promoted.remove(job_id)
+                now = True
+            j = Job(self.seq, now, job_id)
+            if job_id:
+                self.jobs[job_id] = j
+            return j
+
+    def forget(self, j):
+        with self.cv:
+            if j.id:
+                self.jobs.pop(j.id, None)
+
+    def promote(self, job_id):
+        with self.cv:
+            j = self.jobs.get(job_id)
+            if j:
+                j.now = True
+                self.cv.notify_all()
+            else:
+                self.promoted = (self.promoted + [job_id])[-64:]
+            return bool(j)
+
+    def first(self):
+        return min(self.waiting, key=lambda j: (not j.now, j.seq))
+
+    def acquire(self, j, gone):
+        with self.cv:
+            self.waiting.append(j)
+            self.cv.notify_all()
+            try:
+                while True:
+                    if gone():
+                        raise Gone()
+                    if self.holder is None and self.first() is j:
+                        self.holder = j
+                        return
+                    self.cv.wait(0.05)
+            finally:
+                self.waiting.remove(j)
+                self.cv.notify_all()
+
+    def release(self, j):
+        with self.cv:
+            if self.holder is j:
+                self.holder = None
+            self.cv.notify_all()
+
+    def should_yield(self, j):
+        """Держит карту предзагрузка, а кто-то ждёт `now`."""
+        with self.cv:
+            return not j.now and any(w.now for w in self.waiting)
+
+
 def to_pcm(audio, rate):
     """Тензор/массив float [-1, 1] любой частоты → PCM s16le 24 кГц моно."""
     try:
@@ -114,8 +194,8 @@ class OmniVoiceEngine:
                 log("prompt: create_voice_clone_prompt упал, беру путь:", e)
         return {"ref_audio": str(wav_path), "ref_text": text or None}
 
-    def generate(self, text, voice, instruct):
-        kw = {}
+    def generate(self, text, voice, instruct, num_step=None):
+        kw = {"num_step": num_step}
         if voice is None:
             kw["instruct"] = instruct or self.default_instruct
         elif "design" in voice:
@@ -169,7 +249,7 @@ class PocketEngine:
     def prepare(self, wav_path, text):
         return {"state": self.tts.get_state_for_audio_prompt(str(wav_path))}
 
-    def generate(self, text, voice, instruct):
+    def generate(self, text, voice, instruct, num_step=None):
         if voice is None or "state" not in voice:
             raise LookupError("pocket: нужен образец клона (voice), голоса по описанию нет")
         for frame in self.tts.generate_audio_stream(voice["state"], self.prep(text)):
@@ -247,7 +327,7 @@ def main():
 
         torch.set_num_threads(args.threads)
     voices = Voices(engine, args.data)
-    gen_lock = threading.Lock()
+    gate = Gate()
     state = {"busy": False, "started": time.time(), "waiting": 0, "cancelled": 0}
     log(f"{engine.name}: модель {engine.model_id} на {engine.device} за {time.time() - t0:.1f} с")
 
@@ -264,21 +344,26 @@ def main():
             raise KeyError(vid)
         return v
 
-    def acquire(gone):
+    def synth(text, voice, instruct, gone=lambda: False, job=None, num_step=None):
+        job = job or gate.job(True)
         state["waiting"] += 1
         try:
-            while not gen_lock.acquire(timeout=0.05):
-                if gone():
-                    raise Gone()
-        finally:
+            gate.acquire(job, gone)
+        except Gone:
             state["waiting"] -= 1
-
-    def synth(text, voice, instruct, gone=lambda: False):
-        acquire(gone)
+            gate.forget(job)
+            state["cancelled"] += 1
+            raise
+        state["waiting"] -= 1
         state["busy"] = True
         try:
             for s in sentences(text):
-                for pcm in engine.generate(s, voice, instruct):
+                if gate.should_yield(job):
+                    state["busy"] = False
+                    gate.release(job)
+                    gate.acquire(job, gone)
+                    state["busy"] = True
+                for pcm in engine.generate(s, voice, instruct, num_step):
                     if gone():
                         raise Gone()
                     yield pcm
@@ -287,7 +372,8 @@ def main():
             raise
         finally:
             state["busy"] = False
-            gen_lock.release()
+            gate.release(job)
+            gate.forget(job)
 
     # Прогрев: первая фраза после старта не платит за компиляцию ядер и кэш.
     warm = args.default_voice if args.default_voice in voices.ids() else (voices.ids()[:1] or [None])[0]
@@ -351,6 +437,10 @@ def main():
                 self.error(400, f"образец: {e}")
 
         def do_POST(self):
+            q = re.match(r"^/v1/queue/([^/?]+)/now$", self.path)
+            if q:
+                self.body()
+                return self.send_json(200, {"found": gate.promote(q.group(1))})
             if self.path != "/v1/audio/speech":
                 return self.error(404, "not found")
             try:
@@ -368,7 +458,8 @@ def main():
             except KeyError as e:
                 return self.error(404, f"нет образца «{e.args[0]}» — загрузите PUT /v1/voices/<id>", "voice_not_found")
             t1 = time.time()
-            it = synth(text, voice, (b.get("instructions") or "").strip() or None, self.gone)
+            ahead = b.get("priority") == "ahead"
+            it = synth(text, voice, (b.get("instructions") or "").strip() or None, self.gone, gate.job(not ahead, b.get("job") or None), b.get("num_step"))
             try:
                 first = next(it)
             except Gone:
@@ -419,7 +510,7 @@ def main():
                 return
             secs = total / 2 / OUT_RATE
             dt = time.time() - t1
-            log(f"speech {len(text)} зн., {secs:.2f} с звука за {dt:.2f} с (RTF {dt / max(secs, 0.01):.2f}), первый звук {ttfa * 1000:.0f} мс")
+            log(f"speech {'ahead' if ahead else 'now'} {len(text)} зн., {secs:.2f} с звука за {dt:.2f} с (RTF {dt / max(secs, 0.01):.2f}), первый звук {ttfa * 1000:.0f} мс")
 
     srv = ThreadingHTTPServer((args.host, args.port), H)
     srv.daemon_threads = True

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createFallbackEngine, createLocalEngine, createSpeaker, isSampleRef, resolveVoice, sampleId } from '../src/index.js'
-import type { AudioChunk, TtsEngine } from '../src/index.js'
+import type { AudioChunk, Engines, SpeakOpts, TtsEngine } from '../src/index.js'
 import { enginesFromCtx } from '../src/node/index.js'
 
 const pcm = (n: number): Uint8Array => new Uint8Array(n).fill(1)
@@ -146,5 +146,126 @@ describe('local engines (DEV-520)', () => {
     expect(both.omnivoice!.voices).not.toBe(both.pocket!.voices)
     const off = enginesFromCtx(ctxOf({ engines: 'omnivoice', omnivoice_url: 'http://lap:8095', omnivoice_fallback: 'off' }), { cache: { get: () => undefined, set: () => {} } })
     expect(Object.keys(off)).toEqual(['omnivoice'])
+  })
+})
+
+describe('очередь локального движка (DEV-581)', () => {
+  const pcm = new Uint8Array(480)
+  const silentEngine = (delay: () => Promise<void>, promoted: string[] = []): TtsEngine => ({
+    kind: 'omnivoice',
+    limit: 0,
+    voices: async () => [],
+    design: async () => ({ id: 'x', cached: false }),
+    promote: (job) => void promoted.push(job),
+    async *speak() {
+      await delay()
+      yield { data: pcm, mime: 'audio/l16; rate=24000; channels=1' }
+    },
+  })
+  const spareEngine: TtsEngine = {
+    kind: 'pocket',
+    limit: 0,
+    voices: async () => [],
+    design: async () => ({ id: 'x', cached: false }),
+    async *speak() {
+      yield { data: pcm, mime: 'audio/l16; rate=24000; channels=1' }
+    },
+  }
+
+  it('порог не считает очередь предзагрузки: идёт с promote', async () => {
+    let go = (): void => {}
+    const gate = new Promise<void>((r) => (go = r))
+    const fb = createFallbackEngine(silentEngine(() => gate), spareEngine, { firstAudioMs: 20 })
+    const it = fb.speak('т', 'v', { priority: 'ahead', job: 'j1' })[Symbol.asyncIterator]()
+    const next = it.next()
+    await new Promise((r) => setTimeout(r, 60))
+    go()
+    const n = await next
+    expect(n.done).toBe(false)
+    expect((n.value as { fallback?: string }).fallback).toBeUndefined()
+  })
+
+  it('понадобившийся кусок без звука за порог уходит запасному', async () => {
+    const promoted: string[] = []
+    const fb = createFallbackEngine(silentEngine(() => new Promise(() => {}), promoted), spareEngine, { firstAudioMs: 20 })
+    const it = fb.speak('т', 'v', { priority: 'ahead', job: 'j2' })[Symbol.asyncIterator]()
+    const next = it.next()
+    await new Promise((r) => setTimeout(r, 40))
+    fb.promote?.('j2')
+    const n = await next
+    expect(promoted).toEqual(['j2'])
+    expect((n.value as { fallback?: string }).fallback).toBe('pocket')
+  })
+
+  it('локальный движок шлёт priority и job, promote — POST очереди', async () => {
+    const calls: { url: string; body?: unknown }[] = []
+    const engine = createLocalEngine({
+      kind: 'omnivoice',
+      baseUrl: 'http://x',
+      fetch: (async (url: string, init?: RequestInit) => {
+        calls.push({ url, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) })
+        return new Response(url.endsWith('/now') ? '{}' : pcm)
+      }) as typeof fetch,
+    })
+    for await (const _ of engine.speak('т', 'v', { priority: 'ahead', job: 'j3' })) void _
+    engine.promote?.('j3')
+    expect(calls[0]!.body).toMatchObject({ priority: 'ahead', job: 'j3' })
+    expect(calls[1]!.url).toBe('http://x/v1/queue/j3/now')
+  })
+})
+
+describe('speaker: один синтез на кусок (DEV-581)', () => {
+  const mime = 'audio/l16; rate=24000; channels=1'
+  const setup = () => {
+    const seen: SpeakOpts[] = []
+    const promoted: string[] = []
+    const aborted: boolean[] = []
+    let release = (): void => {}
+    const gate = new Promise<void>((r) => (release = r))
+    const engine: TtsEngine = {
+      kind: 'omnivoice',
+      limit: 0,
+      voices: async () => [{ id: 'v', type: 'prebuilt', name: 'v', lang: 'ru-RU' }],
+      design: async () => ({ id: 'x', cached: false }),
+      promote: (j) => void promoted.push(j),
+      async *speak(_t, _v, opts, signal) {
+        seen.push(opts)
+        signal?.addEventListener('abort', () => aborted.push(true))
+        yield { data: new Uint8Array(4), mime }
+        await Promise.race([gate, new Promise<void>((_, rej) => signal?.addEventListener('abort', () => rej(new Error('снято'))))])
+        yield { data: new Uint8Array(4), mime }
+      },
+    }
+    const speaker = createSpeaker({ engines: { omnivoice: engine } as Engines, defaultVoice: 'omnivoice:v' })
+    return { speaker, seen, promoted, aborted, release: () => release() }
+  }
+
+  it('кусок из предзагрузки играет потоком и повышается в очереди', async () => {
+    const t = setup()
+    const early = t.speaker.synth('фраза', { play: 'ahead' }, 'pcm')
+    early.catch(() => {})
+    await new Promise((r) => setTimeout(r, 5))
+    const it = t.speaker.stream(['фраза'], { play: 'now' }, 'pcm')[Symbol.asyncIterator]()
+    const first = await it.next()
+    expect(first.done).toBe(false)
+    expect(t.seen).toHaveLength(1)
+    expect(t.seen[0]).toMatchObject({ priority: 'ahead' })
+    expect(t.promoted).toEqual([t.seen[0]!.job])
+    t.release()
+    for (let n = await it.next(); !n.done; n = await it.next()) void n
+    await early
+  })
+
+  it('все клиенты предзагрузки ушли — синтез снимается', async () => {
+    const t = setup()
+    const ac = new AbortController()
+    const it = t.speaker.stream(['фраза'], { play: 'ahead' }, 'pcm', ac.signal)[Symbol.asyncIterator]()
+    const n = it.next()
+    n.catch(() => {})
+    await new Promise((r) => setTimeout(r, 5))
+    ac.abort()
+    await expect(n).rejects.toThrow()
+    await new Promise((r) => setTimeout(r, 5))
+    expect(t.aborted).toEqual([true])
   })
 })

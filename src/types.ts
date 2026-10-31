@@ -58,6 +58,10 @@ export interface SpeakOpts {
   speed?: number | undefined
   /** Желаемый формат: движок, умеющий его сам (Edge, Chirp, OpenAI — mp3), отдаёт его без перекодирования. */
   format?: 'mp3' | 'pcm' | undefined
+  /** Очередь локального движка (DEV-581): `ahead` — предзагрузка, уступает куску, нужному сейчас. */
+  priority?: 'now' | 'ahead' | undefined
+  /** Id запроса для `TtsEngine.promote`. */
+  job?: string | undefined
 }
 
 /**
@@ -88,6 +92,8 @@ export interface TtsEngine {
   /** Библиотека готовых голосов провайдера (Gemini — тысячи, с кэшем). */
   library?(o?: { fresh?: boolean }): Promise<VoiceInfo[]>
   speak(text: string, voiceId: string, opts: SpeakOpts, signal?: AbortSignal): AsyncIterable<AudioChunk>
+  /** Движок с очередью (DEV-581): кусок `job` из предзагрузки понадобился — вперёд очереди. */
+  promote?(job: string): void
 }
 
 /** Кэш `(lang|design) → id`: у сервиса, не у движка. */

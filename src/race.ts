@@ -16,6 +16,8 @@ export interface PrimaryRun<T> {
   failed(): boolean
   /** Все кадры: накопленные, затем по мере прихода. Читателей может быть сколько угодно. */
   frames(): AsyncGenerator<AudioChunk>
+  /** Снять синтез: кусок больше никому не нужен. */
+  cancel(): void
   /** Звук дописан и обработан (`finish`). */
   readonly done: Promise<T>
 }
@@ -66,6 +68,7 @@ export function startPrimary<T>(open: (signal: AbortSignal) => AsyncIterable<Aud
   return {
     first,
     firstMs: () => firstMs,
+    cancel: () => ctl.abort(new Error('speak: синтез отменён')),
     failed: () => !!error,
     async *frames() {
       for (let i = 0; ; ) {

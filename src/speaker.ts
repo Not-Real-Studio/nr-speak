@@ -15,7 +15,7 @@ import { collect, concat, CONTENT_TYPE, convert, ffmpegArgs, OUT_RATE, wavHeader
 import type { AudioChunk, SpeakOpts, TtsEngine } from './types.js'
 import { isMp3, isPcm, rateOf } from './types.js'
 import { createFallbackEngine } from './local.js'
-import type { PrimaryRun } from './race.js'
+import type { Pick, PrimaryRun } from './race.js'
 import { pickFirst, startPrimary } from './race.js'
 
 export interface SegmentCache {
@@ -61,7 +61,9 @@ export interface PieceEvent {
   key: string
   /** Основной голос (`vertex:Sulafat`). */
   voice: string
-  played: 'primary' | 'parallel'
+  played: 'primary' | 'parallel' | 'cache'
+  /** Какой движок дал звук (`omnivoice`, запасной `pocket`); из кэша — нет. */
+  engine?: string | undefined
   reason?: string | undefined
   /** Мс от момента «нужен» до звука, отданного наружу. */
   firstMs: number
@@ -80,6 +82,32 @@ export interface SynthResult {
   cached: boolean
   key: string
   voice: Resolved
+}
+
+/** Основной голос куска: один синтез на всех, кто его просит. */
+interface Run {
+  run: PrimaryRun<SynthResult>
+  at: number
+  engine: TtsEngine
+  job: string
+  /** Кусок нужен для игры (не только предзагрузка). */
+  now: boolean
+  clients: number
+}
+
+/** Ждать промис, пока клиент не ушёл. */
+function untilAbort<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p
+  return new Promise<T>((resolve, reject) => {
+    const off = (): void => signal.removeEventListener('abort', onAbort)
+    const onAbort = (): void => {
+      off()
+      reject(new Error('speak: синтез отменён'))
+    }
+    if (signal.aborted) return onAbort()
+    signal.addEventListener('abort', onAbort, { once: true })
+    p.then((v) => (off(), resolve(v)), (e: unknown) => (off(), reject(e)))
+  })
 }
 
 export interface SpeakerOpts {
@@ -271,7 +299,34 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
   // Один и тот же кусок разом (клиент + предзагрузка) — один синтез.
   const inflight = new Map<string, Promise<SynthResult>>()
   // Основные голоса кусков гонки: живут мимо клиента и дописывают звук в кэш.
-  const runs = new Map<string, { run: PrimaryRun<SynthResult>; at: number }>()
+  const runs = new Map<string, Run>()
+  let jobs = 0
+
+  // Локальный движок с очередью: кусок всегда один общий синтез, просьбы подключаются к нему (DEV-581).
+  const queued = async (voice: Resolved, req: SpeakRequest): Promise<boolean> => !!req.play && !!(await engineFor(voice, req)).promote
+
+  /** Кусок понадобился для игры: идёт вперёд очереди, порог первого звука считается отсюда. */
+  const promote = (e: Run): void => {
+    if (e.now) return
+    e.now = true
+    e.engine.promote?.(e.job)
+  }
+
+  /** Клиент держит кусок: все ушли — синтез снимается, кроме гонки (там основной пишет кэш). */
+  function hold(e: Run, signal?: AbortSignal): () => void {
+    e.clients++
+    let gone = false
+    const leave = (): void => {
+      if (gone) return
+      gone = true
+      e.clients--
+      signal?.removeEventListener('abort', leave)
+      if (e.clients === 0 && signal?.aborted && e.engine.promote) e.run.cancel()
+    }
+    signal?.addEventListener('abort', leave, { once: true })
+    if (signal?.aborted) leave()
+    return leave
+  }
 
   const speakOpts = (engine: TtsEngine, req: SpeakRequest, format: Format): SpeakOpts => {
     const speed = speedOf(req)
@@ -282,7 +337,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     }
   }
 
-  async function primaryOf(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved): Promise<{ run: PrimaryRun<SynthResult>; at: number }> {
+  async function primaryOf(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved): Promise<Run> {
     const had = runs.get(k)
     if (had && !had.run.failed()) return had
     const engine = await engineFor(voice, req)
@@ -290,8 +345,10 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     if (again && !again.run.failed()) return again
     const speed = speedOf(req)
     stats.synth++
+    const job = `${k.slice(0, 16)}-${++jobs}`
+    const queue: SpeakOpts = engine.promote ? { job, priority: req.play === 'ahead' ? 'ahead' : 'now' } : {}
     const run = startPrimary<SynthResult>(
-      (sig) => engine.speak(text, voice.voice, speakOpts(engine, req, format), sig),
+      (sig) => engine.speak(text, voice.voice, { ...speakOpts(engine, req, format), ...queue }, sig),
       async (frames) => {
         const mime = frames[0]!.mime
         const data = await convert({ data: concat(frames.map((c) => c.data)), mime }, format, { speed: engine.nativeSpeed ? 1 : speed, ffmpeg: o.ffmpeg })
@@ -300,7 +357,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
       },
       o.parallel?.primaryMaxMs ?? 120_000,
     )
-    const entry = { run, at: Date.now() }
+    const entry: Run = { run, at: Date.now(), engine, job, now: req.play !== 'ahead', clients: 0 }
     runs.set(k, entry)
     inflight.set(k, run.done)
     const clear = (): void => {
@@ -317,7 +374,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     if (!text.trim()) throw new Error('speak: пустой текст')
     const req = await expandCollection(req0, o.collection)
     const { key: k, voice } = await key(text, req, format)
-    if (await raceFor(voice, req)) {
+    if ((await raceFor(voice, req)) || (await queued(voice, req))) {
       // Целым куском гонки нет: предзагрузка копит основной, потоком играет `live`.
       const hit = await o.cache?.get(k)
       if (hit) {
@@ -417,15 +474,27 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
   }
 
   /** Кусок гонки: играет основной или параллельный, основной дописывается в кэш в любом случае. */
-  async function* race(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved, spare: { engine: TtsEngine; voice: string }, signal?: AbortSignal, onFirst: () => void = () => {}): AsyncGenerator<Uint8Array> {
+  async function* race(text: string, req: SpeakRequest, format: Format, k: string, voice: Resolved, spare: { engine: TtsEngine; voice: string } | undefined, signal?: AbortSignal, onFirst: () => void = () => {}): AsyncGenerator<Uint8Array> {
     const need = Date.now()
-    const { run, at } = await primaryOf(text, req, format, k, voice)
-    const pick = await pickFirst(
-      run,
-      (sig) => spare.engine.speak(text, spare.voice, speakOpts(spare.engine, req, format), sig),
-      o.parallel?.firstAudioMs ?? 1000,
-      signal,
-    )
+    const entry = await primaryOf(text, req, format, k, voice)
+    const { run, at } = entry
+    promote(entry)
+    const leave = hold(entry, signal)
+    try {
+      yield* played()
+    } finally {
+      leave()
+    }
+
+    async function* played(): AsyncGenerator<Uint8Array> {
+    const pick: Pick = spare
+      ? await pickFirst(
+          run,
+          (sig) => spare.engine.speak(text, spare.voice, speakOpts(spare.engine, req, format), sig),
+          o.parallel?.firstAudioMs ?? 1000,
+          signal,
+        )
+      : { winner: 'primary', first: await untilAbort(run.first, signal), frames: run.frames() }
     if (pick.winner === 'primary') stats.primary++
     else stats.parallel++
     const firstMs = Date.now() - need
@@ -435,6 +504,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
         key: k,
         voice: `${voice.engine}:${voice.voice}`,
         played: pick.winner,
+        engine: pick.first.fallback ?? (pick.winner === 'parallel' ? spare?.engine.kind : voice.engine) ?? voice.engine,
         firstMs,
         ...(pick.reason ? { reason: pick.reason } : {}),
         ...(primaryMs !== undefined ? { primaryMs } : {}),
@@ -444,13 +514,14 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     }
     run.first.then(report, report)
     onFirst()
-    const native = pick.winner === 'primary' ? (await engineFor(voice, req)).nativeSpeed : spare.engine.nativeSpeed
+    const native = pick.winner === 'primary' ? (await engineFor(voice, req)).nativeSpeed : spare?.engine.nativeSpeed
     const it = pick.frames[Symbol.asyncIterator]()
     await it.next()
     try {
       yield* encoded(pick.first, it, native ? 1 : speedOf(req), format, [])
     } finally {
       await it.return?.(undefined)?.catch?.(() => {})
+    }
     }
   }
 
@@ -459,17 +530,24 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     if (!text.trim()) throw new Error('speak: пустой текст')
     const { key: k, voice } = await key(text, req, format)
     const spare = await raceFor(voice, req)
-    if (spare) {
+    if (spare || (await queued(voice, req))) {
       const hit = await o.cache?.get(k)
       if (hit) {
         stats.hits++
+        if (req.play === 'now') o.onPiece?.({ key: k, voice: `${voice.engine}:${voice.voice}`, played: 'cache', firstMs: 0 })
         onFirst()
         return yield hit
       }
       if (req.play === 'now') return yield* race(text, req, format, k, voice, spare, signal, onFirst)
-      const r = await (await primaryOf(text, req, format, k, voice)).run.done
-      onFirst()
-      return yield r.data
+      const entry = await primaryOf(text, req, format, k, voice)
+      const leave = hold(entry, signal)
+      try {
+        const r = await untilAbort(entry.run.done, signal)
+        onFirst()
+        return yield r.data
+      } finally {
+        leave()
+      }
     }
     const running = inflight.get(k)
     if (running) {
@@ -536,7 +614,8 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     const req = await expandCollection(req0, o.collection)
     // wav: один заголовок на поток, куски — сырым PCM.
     const part: Format = format === 'wav' ? 'pcm' : format
-    const racing = !!(await raceFor(await resolve(req.voice, req.engine), req))
+    const resolved = await resolve(req.voice, req.engine)
+    const racing = !!(await raceFor(resolved, req)) || (await queued(resolved, req))
     let started = false
     let ahead: Promise<SynthResult> | undefined
     for (let i = 0; i < texts.length; i++) {

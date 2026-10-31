@@ -97,7 +97,10 @@ export function createLocalEngine(o: LocalEngineOpts): TtsEngine {
   async function post(text: string, voice: string, opts: SpeakOpts, signal?: AbortSignal): Promise<Response> {
     const body: Record<string, unknown> = { model: o.kind, input: text, voice, response_format: 'pcm' }
     if (opts.instruct?.trim()) body.instructions = opts.instruct.trim()
-    const timeout = AbortSignal.timeout(o.timeoutMs ?? 30_000)
+    if (opts.job) body.job = opts.job
+    if (opts.priority) body.priority = opts.priority
+    // Предзагрузка стоит в очереди сколько надо; порог соединения — только на живой кусок.
+    const timeout = AbortSignal.timeout((o.timeoutMs ?? 30_000) * (opts.priority === 'ahead' ? 4 : 1))
     return http(`${base}/v1/audio/speech`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...auth },
@@ -109,6 +112,9 @@ export function createLocalEngine(o: LocalEngineOpts): TtsEngine {
   return {
     kind: o.kind,
     limit: 0,
+    promote(job: string) {
+      void http(`${base}/v1/queue/${encodeURIComponent(job)}/now`, { method: 'POST', headers: auth, signal: AbortSignal.timeout(3000) }).catch(() => {})
+    },
     async voices(): Promise<VoiceInfo[]> {
       const res = await http(`${base}/v1/audio/voices`, { headers: auth, signal: AbortSignal.timeout(5000) })
       if (!res.ok) throw statusError(`${o.kind}.voices: HTTP ${res.status}`, res.status)
@@ -192,6 +198,8 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
   const now = o.now ?? Date.now
   const name = o.backupName ?? backup.kind ?? 'backup'
   let downUntil = 0
+  // Предзагрузка без порога: счёт идёт с момента, когда кусок понадобился (`promote`, DEV-581).
+  const waits = new Map<string, () => void>()
 
   async function* viaBackup(text: string, voiceId: string, opts: SpeakOpts, signal?: AbortSignal): AsyncGenerator<AudioChunk> {
     for await (const c of backup.speak(text, voiceId, opts, signal)) yield { ...c, fallback: name }
@@ -209,6 +217,14 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
       }
     },
     design: (spec) => primary.design(spec),
+    ...(primary.promote
+      ? {
+          promote(job: string) {
+            primary.promote?.(job)
+            waits.get(job)?.()
+          },
+        }
+      : {}),
     async *speak(text: string, voiceId: string, opts: SpeakOpts, signal?: AbortSignal): AsyncGenerator<AudioChunk> {
       if (now() < downUntil) {
         o.onFallback?.({ reason: 'cooldown', skipped: true })
@@ -219,7 +235,13 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
       signal?.addEventListener('abort', onAbort, { once: true })
       const it = primary.speak(text, voiceId, opts, ac.signal)[Symbol.asyncIterator]()
       let timer: ReturnType<typeof setTimeout> | undefined
-      const late = new Promise<'late'>((resolve) => (timer = setTimeout(() => resolve('late'), firstMs)))
+      const late = new Promise<'late'>((resolve) => {
+        const arm = (): void => {
+          timer ??= setTimeout(() => resolve('late'), firstMs)
+        }
+        if (opts.priority === 'ahead' && opts.job) waits.set(opts.job, arm)
+        else arm()
+      })
       let first: IteratorResult<AudioChunk> | 'late'
       try {
         const next = it.next()
@@ -228,6 +250,7 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
         first = await Promise.race([next, late])
       } catch (err) {
         clearTimeout(timer)
+        if (opts.job) waits.delete(opts.job)
         signal?.removeEventListener('abort', onAbort)
         if (signal?.aborted) throw err
         downUntil = now() + cooldown
@@ -235,6 +258,7 @@ export function createFallbackEngine(primary: TtsEngine, backup: TtsEngine, o: F
         return yield* viaBackup(text, voiceId, opts, signal)
       }
       clearTimeout(timer)
+      if (opts.job) waits.delete(opts.job)
       if (first === 'late') {
         signal?.removeEventListener('abort', onAbort)
         ac.abort()
