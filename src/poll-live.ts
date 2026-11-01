@@ -23,6 +23,10 @@ export interface PollLiveOpts {
   /** Хвост длиннее — голова закрепляется, с (по умолчанию 20). */
   commitSec?: number | undefined
   onPartial?: ((text: string) => void) | undefined
+  /** Сервер перестал отвечать (`ok: false`, причина) и ожил: зовётся только на смене состояния. */
+  onHealth?: ((h: { ok: boolean; reason?: string | undefined }) => void) | undefined
+  /** Сколько ждать один запрос, мс (по умолчанию 8000): лежащая машина иначе молчит до таймаута TCP. */
+  timeoutMs?: number | undefined
   fetch?: typeof fetch | undefined
 }
 
@@ -62,6 +66,13 @@ export function openPollTranscription(o: PollLiveOpts): LiveTranscription {
   let closed = false
   let ended = false
   let failure: Error | null = null
+  let healthy = true
+
+  const health = (ok: boolean, reason?: string): void => {
+    if (ok === healthy) return
+    healthy = ok
+    o.onHealth?.({ ok, ...(reason ? { reason } : {}) })
+  }
 
   const join = (a: string, b: string): string => [a, b].filter((x) => x.trim()).join(' ').trim()
   const text = (): string => join(committed, tail)
@@ -91,7 +102,7 @@ export function openPollTranscription(o: PollLiveOpts): LiveTranscription {
     form.append('model', o.model)
     form.append('response_format', 'json')
     if (o.language) form.append('language', o.language)
-    const r = await doFetch(url, { method: 'POST', body: form, headers: o.apiKey ? { authorization: `Bearer ${o.apiKey}` } : {} })
+    const r = await doFetch(url, { method: 'POST', body: form, headers: o.apiKey ? { authorization: `Bearer ${o.apiKey}` } : {}, signal: AbortSignal.timeout(o.timeoutMs ?? 8000) })
     if (!r.ok) throw new Error(`listen poll: ${o.model} HTTP ${r.status} — ${(await r.text()).slice(0, 200)}`)
     const j = (await r.json()) as { text?: unknown }
     return typeof j.text === 'string' ? j.text.trim() : ''
@@ -109,8 +120,8 @@ export function openPollTranscription(o: PollLiveOpts): LiveTranscription {
       end = bytes
     }
     if (!final && end === sentUpTo) return
-    sentUpTo = end
     const t = await recognize(slice(from, end))
+    sentUpTo = end
     if (closed) return
     tail = t
     o.onPartial?.(text())
@@ -122,8 +133,13 @@ export function openPollTranscription(o: PollLiveOpts): LiveTranscription {
       timer = null
       if (closed || ended || busy) return
       busy = step(false)
+        .then(() => {
+          failure = null
+          health(true)
+        })
         .catch((err: Error) => {
           failure = err
+          health(false, err.message)
         })
         .finally(() => {
           busy = null
@@ -148,7 +164,11 @@ export function openPollTranscription(o: PollLiveOpts): LiveTranscription {
       if (timer) clearTimeout(timer)
       timer = null
       await busy
-      await step(true)
+      // Сервер лёг к концу записи: уже услышанное не пропадает, пусто — ошибка (финал пакетом).
+      await step(true).catch((err: Error) => {
+        failure = err
+        health(false, err.message)
+      })
       if (failure && !text()) throw failure
       return text()
     },

@@ -60,6 +60,10 @@ export interface Transcript {
   segments?: TranscriptSegment[] | undefined
   words?: TranscriptWord[] | undefined
   model: string
+  /** Какая модель ответила на самом деле (сервер назвал в ответе); нет — та, что спрошена. */
+  served?: string | undefined
+  /** Сервер ушёл на запасную модель — почему (`$fallback` алиаса гейта). */
+  fallback?: string | undefined
   /** Сколько терминов словаря ушло в запрос (0 — без словаря); с сегментами и словарём — два запроса. */
   vocabulary: number
 }
@@ -478,6 +482,9 @@ const AUDIO_EXT: Record<string, string> = { 'audio/wav': 'wav', 'audio/mp3': 'mp
 interface VerboseJson {
   text?: string
   language?: string
+  /** Кто распознал: гейт отдаёт настоящую модель за алиасом. */
+  model?: string
+  fallback?: string
   words?: Array<{ word?: string; text?: string; start?: number; end?: number; speaker?: string }>
   segments?: Array<{ start?: number; end?: number; text?: string; speaker?: string }>
 }
@@ -524,6 +531,8 @@ export function createOpenAITranscriber(o: OpenAITranscriberOpts): SttEngine {
         ...(language ? { language } : {}),
         ...(timed ? { words, segments: segments ?? segmentsOf(words) } : {}),
         model: o.model,
+        ...(typeof data.model === 'string' && data.model ? { served: data.model } : {}),
+        ...(typeof data.fallback === 'string' && data.fallback ? { fallback: data.fallback } : {}),
         vocabulary: vocab.length,
       }
     },

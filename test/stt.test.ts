@@ -209,6 +209,17 @@ describe('stt: node', () => {
     expect(() => listenerFromCtx(fakeCtx({ speak: { listen_model: 'openai:t' } }))).toThrow(/не задан провайдер/)
   })
 
+  it('createOpenAITranscriber: настоящая модель и запасной путь — из ответа сервера', async () => {
+    const reply = (b: object): Response => new Response(JSON.stringify(b), { status: 200 })
+    const audio = { data: new Uint8Array(4), mime: 'audio/wav' }
+    const a = await createOpenAITranscriber({ baseUrl: 'https://g/v1', model: 'transcribe', fetch: (async () => reply({ text: 'т', model: 'openai:gigaam-v3-e2e' })) as typeof fetch }).transcribe(audio)
+    expect([a.model, a.served, a.fallback]).toEqual(['transcribe', 'openai:gigaam-v3-e2e', undefined])
+    const b = await createOpenAITranscriber({ baseUrl: 'https://g/v1', model: 'transcribe', fetch: (async () => reply({ text: 'т', model: 'studio:gemini', fallback: '502: m2' })) as typeof fetch }).transcribe(audio)
+    expect([b.served, b.fallback]).toEqual(['studio:gemini', '502: m2'])
+    const c = await createOpenAITranscriber({ baseUrl: 'https://g/v1', model: 'transcribe', fetch: (async () => reply({ text: 'т' })) as typeof fetch }).transcribe(audio)
+    expect(c.served).toBeUndefined()
+  })
+
   it('createOpenAITranscriber: multipart verbose_json, слова со спикером, словарь — prompt', async () => {
     let form: FormData | undefined
     let auth = ''

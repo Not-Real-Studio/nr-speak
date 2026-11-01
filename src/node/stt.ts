@@ -277,7 +277,7 @@ export function liveFromCtx(ctx: unknown, o: { model?: string | undefined; WebSo
     if (!p.baseUrl) throw new Error(`listen live: нет $base_url в ## $provider ${pname} ~/.runz/config.md`)
     const baseUrl = p.baseUrl
     const model = m[2]!.trim()
-    return { model: raw, open: (s) => openPollTranscription({ baseUrl, apiKey: p.apiKey, model, rate: s.rate, language: s.language, onPartial: s.onPartial }) }
+    return { model: raw, open: (s) => openPollTranscription({ baseUrl, apiKey: p.apiKey, model, rate: s.rate, language: s.language, onPartial: s.onPartial, onHealth: s.onHealth }) }
   }
   if (m && m[1] !== 'studio') throw new Error(`listen live: движок «${m[1]}» не поддержан — studio: (Live API AI Studio) или openai: (псевдопоток)`)
   const model = (m ? m[2]! : raw).trim() || LIVE_TRANSCRIBE_MODEL

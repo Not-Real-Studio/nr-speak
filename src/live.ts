@@ -74,6 +74,8 @@ export interface LiveTranscribeOpts {
   onEvent?: ((e: LiveEvent) => void) | undefined
   /** Неустранимая ошибка (первая сессия не поднялась, обрывы сверх `reconnects`). */
   onError?: ((err: Error) => void) | undefined
+  /** Псевдопоток: сервер распознавания перестал отвечать и ожил (`openPollTranscription`). */
+  onHealth?: ((h: { ok: boolean; reason?: string | undefined }) => void) | undefined
 }
 
 export interface LiveTranscription {
