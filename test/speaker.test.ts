@@ -200,3 +200,20 @@ describe('speaker', () => {
     expect(dec(await streamAll(s.stream(['x'], { voice: 'Svetlana' }, 'mp3')))).toBe('[ru-RU-SvetlanaNeural:x]')
   })
 })
+
+describe('Speaker: разметка до движка не доходит (DEV-602)', () => {
+  it('движок получает очищенный текст', async () => {
+    const v = mockEngine({ kind: 'vertex', voices: ['Kore'] })
+    const s = createSpeaker({ engines: { vertex: v.engine }, defaultVoice: 'vertex:Kore', cache: memCache() })
+    await s.synth('## Итог: *главное*', {}, 'pcm')
+    expect(v.calls.map((c) => c.text)).toEqual(['Итог: главное'])
+  })
+
+  it('кусок из одной разметки в потоке не роняет остальные', async () => {
+    const v = mockEngine({ kind: 'vertex', voices: ['Kore'] })
+    const s = createSpeaker({ engines: { vertex: v.engine }, defaultVoice: 'vertex:Kore', cache: memCache() })
+    const got: Uint8Array[] = []
+    for await (const b of s.stream(['***', 'Дальше'], {}, 'pcm')) got.push(b)
+    expect(v.calls.map((c) => c.text)).toEqual(['Дальше'])
+  })
+})

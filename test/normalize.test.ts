@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { blocksText, cleanInline, inlineCode, l0Markdown, l0Text, parseBoxTable, stripTokens, tableText } from '../src/index.js'
+import { blocksText, cleanInline, inlineCode, l0Markdown, l0Text, parseBoxTable, speechText, stripTokens, tableText } from '../src/index.js'
 
 const md = (s: string, o = {}): string => blocksText(l0Markdown(s, o).blocks)
 
@@ -116,4 +116,22 @@ describe('L0: простой текст', () => {
     expect(tableText([['имя'], ['Аня'], ['Боря']])).toBe('Аня. Боря.')
     expect(tableText([['', 'x', 'y'], ['a', '', '2']])).toBe('a: y — 2.')
   })
+})
+
+describe('speechText: разметка не звучит (DEV-602)', () => {
+  it.each([
+    ['## Заголовок', 'Заголовок'],
+    ['Текст с *курсивом* и **жирным** и ***обоими***', 'Текст с курсивом и жирным и обоими'],
+    ['_курсив_ и __жирный__, а snake_case цел', 'курсив и жирный, а snake_case цел'],
+    ['Хвост *без пары', 'Хвост без пары'],
+    ['**Метка:** значение', 'Метка: значение'],
+    ['- первый\n* второй\n1. третий', 'первый\nвторой\nтретий'],
+    ['> цитата', 'цитата'],
+    ['---', ''],
+    ['***', ''],
+    ['[ссылка](https://x.y) и `код`', 'ссылка и код'],
+    ['| a | b |\n|---|---|\n| 1 | 2 |', 'a, b\n\n1, 2'],
+    ['— Привет, — сказал он. -5 градусов', '— Привет, — сказал он. -5 градусов'],
+    ['В 2026 году. Сумма 2 * 3', 'В 2026 году. Сумма 2 3'],
+  ])('%s', (src, out) => expect(speechText(src)).toBe(out))
 })

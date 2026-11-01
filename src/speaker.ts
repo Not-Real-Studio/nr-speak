@@ -15,6 +15,7 @@ import { collect, concat, CONTENT_TYPE, convert, ffmpegArgs, OUT_RATE, wavHeader
 import type { AudioChunk, SpeakOpts, TtsEngine } from './types.js'
 import { isMp3, isPcm, rateOf } from './types.js'
 import { createFallbackEngine } from './local.js'
+import { speechText } from './normalize.js'
 import type { Pick, PrimaryRun } from './race.js'
 import { pickFirst, startPrimary } from './race.js'
 
@@ -206,6 +207,22 @@ function pinned(engine: TtsEngine, voice: string, kind: string): TtsEngine {
   }
 }
 
+/** Движки со своей чисткой текста: одна точка на все пути и голоса, ключ кэша не меняется. */
+function plainEngines(engines: Engines): Engines {
+  const out: Engines = {}
+  for (const [name, e] of Object.entries(engines)) {
+    if (!e) continue
+    out[name as EngineName] = {
+      ...e,
+      async *speak(text: string, voice: string, opts: SpeakOpts, signal?: AbortSignal) {
+        const clean = speechText(text)
+        if (clean) yield* e.speak(clean, voice, opts, signal)
+      },
+    }
+  }
+  return out
+}
+
 const hex = (buf: ArrayBuffer): string => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
 
 export async function sha256(s: string): Promise<string> {
@@ -217,6 +234,7 @@ export const segmentKey = (engine: string, voice: string, instruct: string, spee
   sha256([engine, voice, instruct, String(speed), text].join('|'))
 
 export function createSpeaker(o: SpeakerOpts): Speaker {
+  const engines = plainEngines(o.engines)
   const stats = { synth: 0, hits: 0, primary: 0, parallel: 0 }
   const speedOf = (req: SpeakRequest): number => {
     const s = req.speed ?? 1
@@ -227,7 +245,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     // Голос по умолчанию из коллекции (`$voice: @slug`, DEV-520) разворачивается так же, как голос запроса.
     const own = voice?.trim() || (!engine && o.defaultVoice?.trim().startsWith('@') ? o.defaultVoice.trim() : undefined)
     const r = await expandCollection({ voice: own, engine }, o.collection)
-    return resolveVoice(o.engines, r.voice, { engine: r.engine, defaultVoice: o.defaultVoice })
+    return resolveVoice(engines, r.voice, { engine: r.engine, defaultVoice: o.defaultVoice })
   }
 
   // Цепочки голосов (`fallback`) — по одной на набор: в звене живёт пропуск упавшего (`cooldownMs`).
@@ -237,13 +255,13 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     let p = chains.get(id)
     if (!p) {
       p = (async () => {
-        const links: { engine: TtsEngine; name: string }[] = [{ engine: pinned(o.engines[voice.engine]!, voice.voice, voice.engine), name: `${voice.engine}:${voice.voice}` }]
+        const links: { engine: TtsEngine; name: string }[] = [{ engine: pinned(engines[voice.engine]!, voice.voice, voice.engine), name: `${voice.engine}:${voice.voice}` }]
         for (const v of fallback) {
           try {
             const r = await resolve(v)
             const name = `${r.engine}:${r.voice}`
             if (links.some((l) => l.name === name)) continue
-            links.push({ engine: pinned(o.engines[r.engine]!, r.voice, r.engine), name })
+            links.push({ engine: pinned(engines[r.engine]!, r.voice, r.engine), name })
           } catch {
             // Запасной не настроен на этом сервере (нет движка) — звено пропускается.
           }
@@ -265,7 +283,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     return p
   }
   const engineFor = (voice: Resolved, req: SpeakRequest): Promise<TtsEngine> | TtsEngine =>
-    req.fallback?.length ? chainOf(voice, req.fallback) : o.engines[voice.engine]!
+    req.fallback?.length ? chainOf(voice, req.fallback) : engines[voice.engine]!
 
   // Гонка: голос-страховка без своей цепочки и список страхуемых голосов — один раз на сервер.
   const raced = (async (): Promise<{ engine: TtsEngine; voice: string; insured: Set<string> } | undefined> => {
@@ -278,7 +296,7 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
         const m = await resolve(v || undefined)
         insured.add(`${m.engine}:${m.voice}`)
       }
-      return { engine: o.engines[r.engine]!, voice: r.voice, insured }
+      return { engine: engines[r.engine]!, voice: r.voice, insured }
     } catch {
       // Голос-страховка не настроен на этом сервере — живём без гонки.
       return undefined
@@ -609,8 +627,10 @@ export function createSpeaker(o: SpeakerOpts): Speaker {
     }
   }
 
-  async function* stream(texts: readonly string[], req0: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
-    if (!texts.length) throw new Error('speak: пустой текст')
+  async function* stream(raw: readonly string[], req0: SpeakRequest, format: Format, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
+    if (!raw.length) throw new Error('speak: пустой текст')
+    // Кусок из одной разметки (`---`) молчит, а не роняет поток «нет звука».
+    const texts = raw.filter((t) => speechText(t))
     const req = await expandCollection(req0, o.collection)
     // wav: один заголовок на поток, куски — сырым PCM.
     const part: Format = format === 'wav' ? 'pcm' : format
