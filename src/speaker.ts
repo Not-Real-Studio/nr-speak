@@ -204,6 +204,9 @@ function pinned(engine: TtsEngine, voice: string, kind: string): TtsEngine {
     voices: (opts) => engine.voices(opts),
     design: (spec) => engine.design(spec),
     speak: (text: string, _voice: string, opts: SpeakOpts, signal?: AbortSignal) => engine.speak(text, voice, opts, signal),
+    // Без `alive` звено цепочки считает живой, но медленный сервер упавшим (DEV-646).
+    ...(engine.alive ? { alive: () => engine.alive!() } : {}),
+    ...(engine.promote ? { promote: (job: string) => engine.promote!(job) } : {}),
   }
 }
 

@@ -223,6 +223,29 @@ $tags: $[narrator, low]
     expect(new TextDecoder().decode(r.data)).toBe('[Milena:Раз]')
   })
 
+  it('Speaker: $fallback — основной медленный, но отвечает на alive → ждём его, запасной не зовётся (DEV-646)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'speak-col-'))
+    writeFileSync(join(dir, 'max.mdz'), '$name: Max\n$engine: omnivoice\n$voice: s\n$fallback: $[say:Milena]\n')
+    const slow: TtsEngine = {
+      kind: 'omnivoice',
+      limit: 0,
+      voices: async () => [],
+      design: async () => {
+        throw new Error('нет')
+      },
+      alive: async () => true,
+      async *speak() {
+        await new Promise((res) => setTimeout(res, 200))
+        yield { data: new TextEncoder().encode('[omni]'), mime: 'audio/l16; rate=24000; channels=1' }
+      },
+    }
+    const say = mockEngine({ kind: 'say', voices: ['Milena'] })
+    const speaker = createSpeaker({ engines: { omnivoice: slow, say: say.engine }, collection: fileCollection(dir), chainFirstAudioMs: 30 })
+    const r = await speaker.synth('Раз', { voice: '@max' }, 'pcm')
+    expect(new TextDecoder().decode(r.data)).toBe('[omni]')
+    expect(say.calls).toEqual([])
+  })
+
   it('save / update / remove: комментарии живут, занятый слаг — с номером', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'speak-col-'))
     writeFileSync(join(dir, 'podcaster-1.mdz'), PODCASTER)
